@@ -87,7 +87,22 @@ var _timer: Timer
 var _high_quality: bool = true
 
 
+## The foliage's quality (HIGH_QUALITY_PARAMETER, which the shaders read too): shadows and detail of
+## the scatters; applied at the next streaming
+func set_high_quality(enabled: bool) -> void:
+    _high_quality = enabled
+    RenderingServer.global_shader_parameter_set(HIGH_QUALITY_PARAMETER, enabled)
+
+
+func is_high_quality() -> bool:
+    return _high_quality
+
+
 func _ready() -> void:
+    # as the project declares it; RenderingServer.global_shader_parameter_get() is the editor's alone
+    # (in a game it logs an error at every call)
+    var declared: Variant = ProjectSettings.get_setting("shader_globals/" + HIGH_QUALITY_PARAMETER)
+    _high_quality = bool(declared.get("value", true)) if declared is Dictionary else true
     _timer = Timer.new()
     _timer.wait_time = STREAM_INTERVAL
     _timer.timeout.connect(_stream)
@@ -358,8 +373,6 @@ func _stream() -> void:
     var camera: Camera3D = _get_camera()
     if not camera or _scatters.is_empty():
         return
-    var high_quality_value: Variant = RenderingServer.global_shader_parameter_get(HIGH_QUALITY_PARAMETER)
-    _high_quality = bool(high_quality_value) if high_quality_value != null else true
     for scatter: Scatter in _scatters.values():
         if scatter.entries.is_empty() or not scatter.config.get("streaming_enabled", true) or not scatter.scenario.is_valid():
             continue
