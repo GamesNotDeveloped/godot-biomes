@@ -1,5 +1,7 @@
 // Terrain3D 1.0.2's own shader, as it generates it for a Terrain3DMaterial
-// (shader_override_enabled with no override, auto_shader off), with one addition: texture slots whose
+// (shader_override_enabled with no override, auto_shader off) - the Terrain3D maszyna-reloaded builds,
+// with its patches/terrain3d-region-window.patch: positions relative to the region map's window
+// (v_vertex, _camera_pos, _instance_origin) - with one addition: texture slots whose
 // look changes with the distance (far_*, far_look()) - a field turning into the grain growing on it
 // past where the grain is drawn, a forest's floor into its trees (far_ground.gd). After an update of
 // Terrain3D, or another setting of the material that changes the shader it generates, the copy is
@@ -46,7 +48,12 @@ render_mode blend_mix,depth_draw_opaque,cull_back,diffuse_burley,specular_schlic
 #endif
 
 // Private uniforms
+// The shader works relative to the region map's window (Terrain3DData.get_region_map_origin_position()),
+// so its floats stay small however far the window is from the world's origin: _camera_pos,
+// _region_locations and the clipmap instance's origin, set at full precision by Terrain3DMesher, are
+// relative to it, and so are v_vertex and UV.
 uniform vec3 _camera_pos = vec3(0.f);
+instance uniform vec3 _instance_origin = vec3(0.f);
 uniform float _mesh_size = 48.f;
 uniform uint _background_mode = 1u; // NONE = 0, FLAT = 1, NOISE = 2
 uniform uint _mouse_layer = 0x80000000u; // Layer 32
@@ -142,8 +149,8 @@ vec3 get_index_uv(const vec2 uv2) {
 }
 
 void vertex() {
-	// Get vertex of flat plane in world coordinates and set world UV
-	v_vertex = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	// Get vertex of flat plane in the window's coordinates and set its UV
+	v_vertex = mat3(MODEL_MATRIX) * VERTEX + _instance_origin;
 
 	// Camera distance to vertex on flat plane
 	v_vertex_xz_dist = length(v_vertex.xz - _camera_pos.xz);
@@ -164,6 +171,7 @@ void vertex() {
 	vec2 start_pos = v_vertex.xz * _vertex_density;
 	vec2 end_pos = (v_vertex.xz - shift * scale) * _vertex_density;
 	v_vertex.xz -= shift * scale * vertex_lerp;
+	VERTEX.xz -= shift * vertex_lerp;
 
 	// UV coordinates in world space. Values are 0 to _region_size within regions
 	UV = v_vertex.xz * _vertex_density;
@@ -180,16 +188,19 @@ void vertex() {
 	if ( !(CAMERA_VISIBLE_LAYERS == _mouse_layer) && 
 			(hole || (_background_mode == 0u && v_region.z == -1))) {
 		v_vertex.x = 0. / 0.;
+		VERTEX.x = v_vertex.x;
 	} else {		
 		// Set final vertex height & calculate vertex normals. 3 lookups
 		ivec3 coord_a = get_index_coord(start_pos, VERTEX_PASS);
 		ivec3 coord_b = get_index_coord(end_pos, VERTEX_PASS);
 		float h = mix(texelFetch(_height_maps, coord_a, 0).r,texelFetch(_height_maps, coord_b, 0).r,vertex_lerp);
 		v_vertex.y = h;
+		VERTEX.y = h;
 	}
 
-	// Convert model space to view space w/ skip_vertex_transform render mode
-	VERTEX = (VIEW_MATRIX * vec4(v_vertex, 1.0)).xyz;
+	// Convert model space to view space w/ skip_vertex_transform render mode. MODELVIEW_MATRIX, not
+	// VIEW_MATRIX and the window's v_vertex: in a double precision build its translation is exact
+	VERTEX = (MODELVIEW_MATRIX * vec4(VERTEX, 1.0)).xyz;
 	NORMAL = normalize((MODELVIEW_MATRIX * vec4(NORMAL, 0.0)).xyz);
 	BINORMAL = normalize((MODELVIEW_MATRIX * vec4(BINORMAL, 0.0)).xyz);
 	TANGENT = normalize((MODELVIEW_MATRIX * vec4(TANGENT, 0.0)).xyz);

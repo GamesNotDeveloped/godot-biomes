@@ -67,6 +67,8 @@ uniform float _region_size = 1024.0;
 uniform float _region_texel_size = 0.0009765625; // = 1/REGION_SIZE
 uniform int _region_map_size = 32;
 uniform int _region_map[1024];
+// The region location at the centre of the region map (Terrain3DData.get_region_map_origin())
+uniform ivec2 _region_map_origin = ivec2(0);
 uniform vec2 _region_locations[1024];
 uniform highp sampler2DArray _height_maps : repeat_disable;
 uniform highp sampler2DArray _control_maps : repeat_disable;
@@ -89,7 +91,7 @@ ivec3 get_index_coord(const vec2 uv, const int search) {
 	for (int i = -1; i < 0; i++) {
 		if ((layer_index == -1 && _background_mode == 0u) || i < 0) {
 			r_uv -= i == -1 ? vec2(0.0) : vec2(float(o_uv.x <= o_uv.y), float(o_uv.y <= o_uv.x));
-			pos = ivec2(floor((r_uv) * _region_texel_size)) + (_region_map_size / 2);
+			pos = ivec2(floor((r_uv) * _region_texel_size)) - _region_map_origin + (_region_map_size / 2);
 			bounds = int(uint(pos.x | pos.y) < uint(_region_map_size));
 			layer_index = (_region_map[ pos.y * _region_map_size + pos.x ] * bounds - 1);
 		}

@@ -49,6 +49,9 @@ class Grass:
     var config: Dictionary = {}
     var scenario: RID
     var terrain_id: int = 0
+    ## The terrain's data whose maps_changed the grass follows: a Terrain3D may make its data anew
+    ## (set_data_directory()), so it is the object followed, not the terrain's current one
+    var maps_data_id: int = 0
     var particles: Array[RID] = []
     var instances: Array[RID] = []
     var offsets: Array[Vector3] = []
@@ -130,6 +133,9 @@ func grass_free(rid: RID) -> void:
     if not grass:
         return
     _destroy_grid(grass)
+    var data: Object = instance_from_id(grass.maps_data_id) if grass.maps_data_id else null
+    if data:
+        data.maps_changed.disconnect(_on_terrain_maps_changed)
     _grasses.erase(rid)
     if _grasses.is_empty():
         get_tree().process_frame.disconnect(_follow_camera)
@@ -142,11 +148,28 @@ func grass_set_scenario(rid: RID, scenario: RID) -> void:
         RenderingServer.instance_set_scenario(instance, scenario)
 
 
-## The Terrain3D the blades grow on (its maps placing them, its textures choosing where)
+## The Terrain3D the blades grow on (its maps placing them, its textures choosing where); its maps
+## made again - regions streamed in or out - are read again at once
 func grass_set_terrain(rid: RID, terrain: Node3D) -> void:
     var grass: Grass = _grasses.get(rid)
+    var previous: Object = instance_from_id(grass.maps_data_id) if grass.maps_data_id else null
+    if previous:
+        previous.maps_changed.disconnect(_on_terrain_maps_changed)
     grass.terrain_id = terrain.get_instance_id() if terrain else 0
+    grass.maps_data_id = terrain.data.get_instance_id() if terrain and terrain.data else 0
+    # one connection a terrain's data, counted by the grasses on it (a signal's connection is its
+    # method's, whatever is bound to it)
+    if grass.maps_data_id:
+        terrain.data.maps_changed.connect(_on_terrain_maps_changed, CONNECT_REFERENCE_COUNTED)
     _create_grid(grass)
+
+
+## A terrain's texture arrays and region map are new ones: the process materials of the grasses
+## placed are told them
+func _on_terrain_maps_changed() -> void:
+    for grass: Grass in _grasses.values():
+        if not grass.particles.is_empty():
+            _set_process_parameters(grass, grass.last_position.snapped(Vector3.ONE))
 
 
 ## The blades' settings (BiomesGrass.get_config()); the grid is made again
@@ -240,6 +263,7 @@ func _set_process_parameters(grass: Grass, camera_position: Vector3) -> void:
     RenderingServer.material_set_param(process, "_region_texel_size", 1.0 / terrain.region_size)
     RenderingServer.material_set_param(process, "_region_map_size", REGION_MAP_SIZE)
     RenderingServer.material_set_param(process, "_region_map", terrain.data.get_region_map())
+    RenderingServer.material_set_param(process, "_region_map_origin", terrain.data.get_region_map_origin())
     RenderingServer.material_set_param(process, "_region_locations", terrain.data.get_region_locations())
     RenderingServer.material_set_param(process, "_height_maps", terrain.data.get_height_maps_rid())
     RenderingServer.material_set_param(process, "_control_maps", terrain.data.get_control_maps_rid())
