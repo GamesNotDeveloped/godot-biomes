@@ -71,7 +71,10 @@ class Scatter:
     ## The physics space the ray finds the surface in, without a terrain
     var space: RID
     var terrain_id: int = 0
-    ## chunk coords -> {multimeshes: Array[RID], instances: Array[RID], count: int, visible: int, center: Vector3}
+    ## The terrain's data whose maps_changed the scatter follows (as Grass.maps_data_id)
+    var maps_data_id: int = 0
+    ## chunk coords -> {multimeshes: Array[RID], instances: Array[RID], count: int, visible: int,
+    ## center: Vector3, missing: bool - points of it stood where the terrain had no region yet}
     var chunks: Dictionary = {}
     ## chunk coords -> WorkerThreadPool task id
     var tasks: Dictionary = {}
@@ -164,12 +167,20 @@ func grass_set_terrain(rid: RID, terrain: Node3D) -> void:
     _create_grid(grass)
 
 
-## A terrain's texture arrays and region map are new ones: the process materials of the grasses
-## placed are told them
+## A terrain's texture arrays and region map are new ones - regions streamed in or out: the grasses
+## placed are told them and span the heights there are now, and a scatter's chunks stood partly off
+## the terrain grow again
 func _on_terrain_maps_changed() -> void:
     for grass: Grass in _grasses.values():
         if not grass.particles.is_empty():
+            var aabb: AABB = _grass_aabb(grass)
+            for particles: RID in grass.particles:
+                RenderingServer.particles_set_custom_aabb(particles, aabb)
             _set_process_parameters(grass, grass.last_position.snapped(Vector3.ONE))
+    for scatter: Scatter in _scatters.values():
+        for coords: Vector2i in scatter.chunks.keys():
+            if scatter.chunks[coords]["missing"]:
+                _drop_chunk(scatter, coords)
 
 
 ## The blades' settings (BiomesGrass.get_config()); the grid is made again
@@ -188,9 +199,7 @@ func _create_grid(grass: Grass) -> void:
     var spacing: float = config["instance_spacing"]
     var rows: int = config["rows"]
     var half_grid: int = config["grid_width"] / 2
-    var height_range: Vector2 = terrain.data.get_height_range()
-    var aabb: AABB = AABB(Vector3(-config["cell_width"] * 0.5, height_range.y, -config["cell_width"] * 0.5),
-            Vector3(config["cell_width"], height_range.x - height_range.y, config["cell_width"]))
+    var aabb: AABB = _grass_aabb(grass)
     var fixed_fps: int = config["process_fixed_fps"]
     for x in range(-half_grid, half_grid + 1):
         for z in range(-half_grid, half_grid + 1):
@@ -215,6 +224,16 @@ func _create_grid(grass: Grass) -> void:
             grass.particles.append(particles)
             grass.instances.append(instance)
     grass.last_position = Vector3.INF
+
+
+## A cell of the grass's grid over the heights of its terrain's regions there are now (an empty
+## range culls the blades wherever the terrain is)
+func _grass_aabb(grass: Grass) -> AABB:
+    var terrain: Node3D = instance_from_id(grass.terrain_id) as Node3D
+    var cell_width: float = grass.config["cell_width"]
+    var height_range: Vector2 = terrain.data.get_height_range()
+    return AABB(Vector3(-cell_width * 0.5, height_range.y, -cell_width * 0.5),
+            Vector3(cell_width, height_range.x - height_range.y, cell_width))
 
 
 func _destroy_grid(grass: Grass) -> void:
@@ -294,6 +313,9 @@ func scatter_free(rid: RID) -> void:
     _wait_for_tasks(scatter)
     for coords: Vector2i in scatter.chunks.keys():
         _drop_chunk(scatter, coords)
+    var data: Object = instance_from_id(scatter.maps_data_id) if scatter.maps_data_id else null
+    if data:
+        data.maps_changed.disconnect(_on_terrain_maps_changed)
     _scatters.erase(rid)
 
 
@@ -316,10 +338,18 @@ func scatter_set_transform(rid: RID, transform: Transform3D) -> void:
     _clear(scatter)
 
 
-## The Terrain3D the biome stands on and grows on the textures of; null: the physics ray
+## The Terrain3D the biome stands on and grows on the textures of; null: the physics ray. Its maps
+## made again - regions streamed in - grow the chunks again that stood partly where it had none
 func scatter_set_terrain(rid: RID, terrain: Node3D) -> void:
     var scatter: Scatter = _scatters.get(rid)
+    var previous: Object = instance_from_id(scatter.maps_data_id) if scatter.maps_data_id else null
+    if previous:
+        previous.maps_changed.disconnect(_on_terrain_maps_changed)
     scatter.terrain_id = terrain.get_instance_id() if terrain else 0
+    scatter.maps_data_id = terrain.data.get_instance_id() if terrain and terrain.data else 0
+    # counted, as the grasses' (grass_set_terrain())
+    if scatter.maps_data_id:
+        terrain.data.maps_changed.connect(_on_terrain_maps_changed, CONNECT_REFERENCE_COUNTED)
     _clear(scatter)
 
 
@@ -520,14 +550,17 @@ func _build_chunk(scatter: Scatter, coords: Vector2i, points: Array) -> void:
             if not terrain and scatter.space.is_valid() else null
     # entry index -> [transforms (local), priorities]
     var buckets: Dictionary = {}
+    # a point where the terrain has no region yet: the chunk grows again when its maps change
+    var missing: bool = false
     for point: Dictionary in points:
         var local: Vector3 = point["position"]
         var global: Vector3 = scatter.transform * local
-        if terrain and not config["terrain_texture"] == TERRAIN_TEXTURE_ANYWHERE \
-                and not _terrain_texture_at(terrain, config, global) == config["terrain_texture"]:
-            continue
         var surface: Variant = _surface_at(scatter, terrain, state, local, global)
         if surface == null:
+            missing = missing or terrain != null
+            continue
+        if terrain and not config["terrain_texture"] == TERRAIN_TEXTURE_ANYWHERE \
+                and not _terrain_texture_at(terrain, config, global) == config["terrain_texture"]:
             continue
         var entry: Dictionary = point["entry"]
         if not buckets.has(entry["index"]):
@@ -535,7 +568,8 @@ func _build_chunk(scatter: Scatter, coords: Vector2i, points: Array) -> void:
         buckets[entry["index"]][1].append(Transform3D(
                 Basis.IDENTITY.rotated(Vector3.UP, point["yaw"]).scaled(point["scale"]), surface))
         buckets[entry["index"]][2].append(point["priority"])
-    var chunk: Dictionary = {"multimeshes": [], "instances": [], "lods": [], "count": 0, "visible": -1, "center": center}
+    var chunk: Dictionary = {"multimeshes": [], "instances": [], "lods": [], "count": 0, "visible": -1, "center": center,
+            "missing": missing}
     var chunk_transform: Transform3D = scatter.transform * Transform3D(Basis.IDENTITY, center)
     for bucket: Array in buckets.values():
         var entry: Dictionary = bucket[0]
