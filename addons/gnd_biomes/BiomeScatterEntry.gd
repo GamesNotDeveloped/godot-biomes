@@ -18,6 +18,22 @@ func _emit_if_changed(current_value: Variant, next_value: Variant) -> Variant:
 	set(value):
 		mesh_scene = _emit_if_changed(mesh_scene, value)
 
+## the model simplified, with its own materials (the Biomes panel's Generate Mid Meshes): drawn
+## instead of it from mid_lod_distance to billboard_lod_distance. Empty: the model all the way.
+@export var mid_scene: PackedScene:
+	set(value):
+		mid_scene = _emit_if_changed(mid_scene, value)
+
+@export_range(0.0, 100000.0, 0.1, "or_greater") var mid_lod_distance: float = 25.0:
+	set(value):
+		mid_lod_distance = _emit_if_changed(mid_lod_distance, maxf(value, 0.0))
+
+## what the model's shadow is drawn with, alone (the Biomes panel's Generate Shadow Meshes): a
+## simplified model, without wind - the model itself then casts none. Empty: the model casts its own.
+@export var shadow_scene: PackedScene:
+	set(value):
+		shadow_scene = _emit_if_changed(shadow_scene, value)
+
 @export var billboard_mesh: Mesh:
 	set(value):
 		billboard_mesh = _emit_if_changed(billboard_mesh, value)

@@ -54,6 +54,9 @@ const HIGH_QUALITY_PARAMETER: StringName = &"gnd_high_quality_foliage"
 const CANOPY_BEGIN_PARAMETER: StringName = &"gnd_canopy_begin"
 
 enum MaskChannel { RED, GREEN, BLUE, ALPHA, LUMINANCE }
+## A model part's shadow: as the biome's shadow_casting says, none (its entry's shadow_scene casts
+## it), or only the shadow (the shadow_scene's parts - hidden when the quality casts none)
+enum PartShadow { CAST, NONE, ONLY }
 ## What grows where the terrain's autoshader is on - nothing, as on the texture painted there, or
 ## as on the texture the autoshader shows by the slope
 enum TerrainAutoshader { NOTHING, BASE_TEXTURE, AUTOSHADER_TEXTURE }
@@ -709,7 +712,7 @@ func _grow_chunk(scatter: Scatter, coords: Vector2i, generation: int, job: Dicti
         buckets[entry["index"]][1].append(Transform3D(Basis.IDENTITY.rotated(Vector3.UP, point["yaw"]).scaled(point["scale"]),
                 inverse * Vector3(global.x, height, global.z)))
         buckets[entry["index"]][2].append(point["priority"])
-    # per part: [mesh, buffer, instances, range begin, range end]
+    # per part: [mesh, buffer, instances, range begin, range end, PartShadow]
     var parts: Array = []
     var count: int = 0
     for bucket: Array in buckets.values():
@@ -720,16 +723,17 @@ func _grow_chunk(scatter: Scatter, coords: Vector2i, generation: int, job: Dicti
         var transforms: Array[Transform3D] = []
         for index: int in order:
             transforms.append(bucket[1][index])
+        var near_end: float = _near_end(entry)
         var lod: float = entry["billboard_lod_distance"]
-        var billboards: Array = entry["billboard_parts"]
-        for part: Dictionary in entry["main_parts"]:
-            if part["mesh"]:
-                parts.append([part["mesh"], _part_buffer(transforms, part["transform"], center), transforms.size(),
-                        0.0, lod if billboards and lod > 0.0 else 0.0])
-        for part: Dictionary in billboards:
-            if part["mesh"]:
-                parts.append([part["mesh"], _part_buffer(transforms, part["transform"], center), transforms.size(),
-                        lod if lod > 0.0 else 0.0, 0.0])
+        var mid: float = _mid_start(entry, near_end)
+        var shadows: Array = entry["shadow_parts"]
+        var model_shadow: PartShadow = PartShadow.NONE if shadows else PartShadow.CAST
+        for group: Array in [[entry["main_parts"], 0.0, mid, model_shadow], [entry["mid_parts"], mid, near_end, model_shadow],
+                [shadows, 0.0, near_end, PartShadow.ONLY], [entry["billboard_parts"], lod if lod > 0.0 else 0.0, 0.0, PartShadow.CAST]]:
+            for part: Dictionary in group[0]:
+                if part["mesh"]:
+                    parts.append([part["mesh"], _part_buffer(transforms, part["transform"], center), transforms.size(),
+                            group[1], group[2], group[3]])
         count += transforms.size()
     scatter.mutex.lock()
     if generation == scatter.generation:
@@ -742,11 +746,11 @@ func _grow_chunk(scatter: Scatter, coords: Vector2i, generation: int, job: Dicti
 ## On the main thread: the chunk grown (_grow_chunk()) drawn - a MultiMesh and its instance a part
 func _make_chunk(scatter: Scatter, coords: Vector2i, grown: Dictionary) -> void:
     var center: Vector3 = grown["center"]
-    var chunk: Dictionary = {"multimeshes": [], "instances": [], "lods": [], "count": grown["count"], "visible": -1,
-            "center": center, "missing": grown["missing"]}
+    var chunk: Dictionary = {"multimeshes": [], "instances": [], "lods": [], "shadows": [], "count": grown["count"],
+            "visible": -1, "center": center, "missing": grown["missing"]}
     var chunk_transform: Transform3D = scatter.transform * Transform3D(Basis.IDENTITY, center)
     for part: Array in grown["parts"]:
-        _add_multimesh(scatter, chunk, chunk_transform, part[0], part[1], part[2], part[3], part[4])
+        _add_multimesh(scatter, chunk, chunk_transform, part[0], part[1], part[2], part[3], part[4], part[5])
     scatter.chunks[coords] = chunk
 
 
@@ -863,8 +867,8 @@ func _build_chunk(scatter: Scatter, coords: Vector2i, points: Array) -> void:
         buckets[entry["index"]][1].append(Transform3D(
                 Basis.IDENTITY.rotated(Vector3.UP, point["yaw"]).scaled(point["scale"]), surface))
         buckets[entry["index"]][2].append(point["priority"])
-    var chunk: Dictionary = {"multimeshes": [], "instances": [], "lods": [], "count": 0, "visible": -1, "center": center,
-            "missing": missing}
+    var chunk: Dictionary = {"multimeshes": [], "instances": [], "lods": [], "shadows": [], "count": 0, "visible": -1,
+            "center": center, "missing": missing}
     var chunk_transform: Transform3D = scatter.transform * Transform3D(Basis.IDENTITY, center)
     for bucket: Array in buckets.values():
         var entry: Dictionary = bucket[0]
@@ -874,24 +878,44 @@ func _build_chunk(scatter: Scatter, coords: Vector2i, points: Array) -> void:
         var transforms: Array[Transform3D] = []
         for index: int in order:
             transforms.append(bucket[1][index])
+        var near_end: float = _near_end(entry)
         var lod: float = entry["billboard_lod_distance"]
-        var billboards: Array = entry["billboard_parts"]
-        _add_multimeshes(scatter, chunk, chunk_transform, entry["main_parts"], transforms, center,
-                0.0, lod if billboards and lod > 0.0 else 0.0)
-        if billboards:
-            _add_multimeshes(scatter, chunk, chunk_transform, billboards, transforms, center, lod if lod > 0.0 else 0.0, 0.0)
+        var mid: float = _mid_start(entry, near_end)
+        var shadows: Array = entry["shadow_parts"]
+        var model_shadow: PartShadow = PartShadow.NONE if shadows else PartShadow.CAST
+        _add_multimeshes(scatter, chunk, chunk_transform, entry["main_parts"], transforms, center, 0.0, mid, model_shadow)
+        _add_multimeshes(scatter, chunk, chunk_transform, entry["mid_parts"], transforms, center, mid, near_end, model_shadow)
+        _add_multimeshes(scatter, chunk, chunk_transform, shadows, transforms, center, 0.0, near_end, PartShadow.ONLY)
+        _add_multimeshes(scatter, chunk, chunk_transform, entry["billboard_parts"], transforms, center,
+                lod if lod > 0.0 else 0.0, 0.0, PartShadow.CAST)
         chunk["count"] += transforms.size()
     scatter.chunks[coords] = chunk
 
 
 ## A MultiMesh and its instance per part, the transforms relative to the chunk's centre, drawn from
-## [param range_begin] to [param range_end] (0: no limit)
+## [param range_begin] to [param range_end] (0: no limit), their shadow [param shadow]
 func _add_multimeshes(scatter: Scatter, chunk: Dictionary, chunk_transform: Transform3D, parts: Array,
-        transforms: Array[Transform3D], center: Vector3, range_begin: float, range_end: float) -> void:
+        transforms: Array[Transform3D], center: Vector3, range_begin: float, range_end: float, shadow: PartShadow) -> void:
     for part: Dictionary in parts:
         if part["mesh"]:
             _add_multimesh(scatter, chunk, chunk_transform, part["mesh"], _part_buffer(transforms, part["transform"], center),
-                    transforms.size(), range_begin, range_end)
+                    transforms.size(), range_begin, range_end, shadow)
+
+
+## Where an entry's model (or its mid model) ends: its billboards' distance, 0 (no limit) without
+## billboards
+static func _near_end(entry: Dictionary) -> float:
+    var lod: float = entry["billboard_lod_distance"]
+    return lod if entry["billboard_parts"] and lod > 0.0 else 0.0
+
+
+## Where an entry's mid model takes over from its model: mid_lod_distance, within [param near_end];
+## near_end itself (the model all the way) without a mid model
+static func _mid_start(entry: Dictionary, near_end: float) -> float:
+    if not entry["mid_parts"]:
+        return near_end
+    var mid: float = entry["mid_lod_distance"]
+    return minf(mid, near_end) if near_end > 0.0 else mid
 
 
 ## The MultiMesh buffer of the part [param part_transform] of the models at [param transforms],
@@ -920,33 +944,49 @@ static func _part_buffer(transforms: Array[Transform3D], part_transform: Transfo
 
 
 ## A MultiMesh of [param mesh] with [param buffer] ([param count] instances) and its instance in the
-## chunk, drawn from [param range_begin] to [param range_end] (0: no limit)
+## chunk, drawn from [param range_begin] to [param range_end] (0: no limit), its shadow [param shadow]
 func _add_multimesh(scatter: Scatter, chunk: Dictionary, chunk_transform: Transform3D, mesh: Mesh,
-        buffer: PackedFloat32Array, count: int, range_begin: float, range_end: float) -> void:
+        buffer: PackedFloat32Array, count: int, range_begin: float, range_end: float, shadow: PartShadow) -> void:
     var multimesh: RID = RenderingServer.multimesh_create()
     RenderingServer.multimesh_set_mesh(multimesh, mesh.get_rid())
     RenderingServer.multimesh_allocate_data(multimesh, count, RenderingServer.MULTIMESH_TRANSFORM_3D)
     RenderingServer.multimesh_set_buffer(multimesh, buffer)
     var instance: RID = RenderingServer.instance_create2(multimesh, scatter.scenario)
     RenderingServer.instance_set_transform(instance, chunk_transform)
-    RenderingServer.instance_geometry_set_cast_shadows_setting(instance, _shadows(scatter))
+    _apply_part_shadow(scatter, instance, shadow)
     if range_begin > 0.0 or range_end > 0.0:
         RenderingServer.instance_geometry_set_visibility_range(instance, range_begin, range_end, 0.0, 0.0,
                 RenderingServer.VISIBILITY_RANGE_FADE_DISABLED)
     chunk["multimeshes"].append(multimesh)
     chunk["instances"].append(instance)
     chunk["lods"].append(count)
+    chunk["shadows"].append(shadow)
 
 
+## The biome's shadows as the quality lets it cast them
 func _shadows(scatter: Scatter) -> RenderingServer.ShadowCastingSetting:
     return scatter.config["shadow_casting"] as RenderingServer.ShadowCastingSetting if scatter.high_quality \
             else RenderingServer.SHADOW_CASTING_SETTING_OFF
 
 
+## An instance's shadow by its part's [param shadow]: the biome's, none, or the shadow alone - hidden
+## when the biome casts none (a shadows-only instance cast none is drawn as it is)
+func _apply_part_shadow(scatter: Scatter, instance: RID, shadow: PartShadow) -> void:
+    var casting: RenderingServer.ShadowCastingSetting = _shadows(scatter)
+    match shadow:
+        PartShadow.CAST:
+            RenderingServer.instance_geometry_set_cast_shadows_setting(instance, casting)
+        PartShadow.NONE:
+            RenderingServer.instance_geometry_set_cast_shadows_setting(instance, RenderingServer.SHADOW_CASTING_SETTING_OFF)
+        PartShadow.ONLY:
+            RenderingServer.instance_geometry_set_cast_shadows_setting(instance, RenderingServer.SHADOW_CASTING_SETTING_SHADOWS_ONLY)
+            RenderingServer.instance_set_visible(instance, not casting == RenderingServer.SHADOW_CASTING_SETTING_OFF)
+
+
 func _apply_shadows(scatter: Scatter) -> void:
     for chunk: Dictionary in scatter.chunks.values():
-        for instance: RID in chunk["instances"]:
-            RenderingServer.instance_geometry_set_cast_shadows_setting(instance, _shadows(scatter))
+        for index: int in chunk["instances"].size():
+            _apply_part_shadow(scatter, chunk["instances"][index], chunk["shadows"][index])
 
 
 ## The density LOD: a chunk draws a share of its instances by its distance from the camera
@@ -1083,8 +1123,9 @@ static func _hash01(a: int, b: int, c: int, salt: int) -> float:
     return float(value) / float(HASH_MASK)
 
 
-## The entries made drawable: their models' mesh parts (with the materials of their instances) and
-## billboard parts (billboard.gdshader), the billboards' materials kept on the entry for its brightness
+## The entries made drawable: their models' mesh parts (with the materials of their instances), their
+## mid models' and shadow meshes', and billboard parts (billboard.gdshader), the billboards' materials
+## kept on the entry for its brightness
 func _resolve_entries(entries: Array) -> Array[Dictionary]:
     var resolved: Array[Dictionary] = []
     var billboard_cache: Dictionary = {}
@@ -1096,6 +1137,8 @@ func _resolve_entries(entries: Array) -> Array[Dictionary]:
         if main_parts.is_empty() or entry.probability <= 0.0:
             continue
         var billboard_parts: Array[Dictionary] = _mesh_parts(entry.billboard_scene, entry.billboard_mesh, true, billboard_cache)
+        var shadow_parts: Array[Dictionary] = _mesh_parts(entry.shadow_scene, null, false, billboard_cache)
+        var mid_parts: Array[Dictionary] = _mesh_parts(entry.mid_scene, null, false, billboard_cache)
         entry.billboard_materials.clear()
         for part: Dictionary in billboard_parts:
             var part_mesh: Mesh = part["mesh"]
@@ -1104,7 +1147,8 @@ func _resolve_entries(entries: Array) -> Array[Dictionary]:
                 if material and material.shader == BILLBOARD_SHADER:
                     material.set_shader_parameter("brightness", entry.billboard_brightness)
                     entry.billboard_materials.append(material)
-        resolved.append({"index": index, "main_parts": main_parts, "billboard_parts": billboard_parts,
+        resolved.append({"index": index, "main_parts": main_parts, "billboard_parts": billboard_parts, "shadow_parts": shadow_parts,
+                "mid_parts": mid_parts, "mid_lod_distance": maxf(entry.mid_lod_distance, 0.0),
                 "probability": entry.probability, "billboard_lod_distance": maxf(entry.billboard_lod_distance, 0.0),
                 "scale_min": entry.scale_min, "scale_max": entry.scale_max})
     return resolved

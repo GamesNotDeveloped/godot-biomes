@@ -32,6 +32,23 @@ const CANOPY_CLUMP_AMPLITUDE := 1.0
 const CANOPY_CLUMP_WAVES: Array[Vector2i] = [Vector2i(1, 2), Vector2i(3, -1), Vector2i(-2, 3), Vector2i(4, 1)]
 ## The terrain material's far_albedo_uv_scale when it does not set it (terrain3d_far.gdshader)
 const FAR_ALBEDO_UV_SCALE_DEFAULT := 0.1
+## A model simplified (a shadow mesh, a mid model): its solid parts (trunk, branches) kept to a share
+## of their triangles by Godot's meshoptimizer, its cards (leaves) to a share of them, each grown to
+## cover as much - a shadow's coarser than a mid model's, seen from 25 m on; a model of fewer
+## triangles gets none - it costs no more itself
+const SHADOW_SOLID_SHARE := 0.15
+const SHADOW_CARD_SHARE := 0.2
+const MID_SOLID_SHARE := 0.3
+const MID_CARD_SHARE := 0.35
+const SIMPLIFIED_MIN_TRIANGLES := 1000
+## A surface whose pieces (triangles joined by their vertices) have this many triangles on average at
+## most is of cards
+const CARD_TRIANGLES_MAX := 4
+## Godot's meshoptimizer LODs of a shadow mesh's solid parts: normals merged and split at these [deg]
+const SHADOW_NORMAL_MERGE_ANGLE := 60.0
+const SHADOW_NORMAL_SPLIT_ANGLE := 25.0
+## The alpha scissor of a card's shadow when its material says none
+const SHADOW_ALPHA_SCISSOR_DEFAULT := 0.5
 
 var _current_biomes: Biomes
 var _current_paint_target: Node3D
@@ -47,6 +64,11 @@ var _billboard_output_dir_edit: LineEdit
 var _billboard_output_dir_button: Button
 var _generate_billboards_button: Button
 var _generate_canopy_button: Button
+var _generate_shadows_button: Button
+var _generate_mids_button: Button
+## What a simplified model is for: an entry's shadow mesh (shadow_scene, a material casting the shadow
+## alone) or its mid model (mid_scene, the model's own materials)
+enum Simplified { SHADOW, MID }
 var _status_label: Label
 var _save_dialog: FileDialog
 var _billboard_dir_dialog: FileDialog
@@ -215,6 +237,18 @@ func _build_panel() -> void:
     _generate_canopy_button.pressed.connect(_on_generate_canopy_pressed)
     _billboard_row.add_child(_generate_canopy_button)
 
+    _generate_shadows_button = Button.new()
+    _generate_shadows_button.text = "Generate Shadow Meshes"
+    _generate_shadows_button.tooltip_text = "Each entry's model simplified, without wind, to cast its shadow alone (shadow.tscn)"
+    _generate_shadows_button.pressed.connect(_on_generate_simplified_pressed.bind(Simplified.SHADOW))
+    _billboard_row.add_child(_generate_shadows_button)
+
+    _generate_mids_button = Button.new()
+    _generate_mids_button.text = "Generate Mid Meshes"
+    _generate_mids_button.tooltip_text = "Each entry's model simplified, with its own materials, drawn from Mid LOD Distance (mid.tscn)"
+    _generate_mids_button.pressed.connect(_on_generate_simplified_pressed.bind(Simplified.MID))
+    _billboard_row.add_child(_generate_mids_button)
+
     _status_label = _biomes_panel.get("status_label")
 
     add_control_to_bottom_panel(_panel, PANEL_TITLE)
@@ -305,6 +339,10 @@ func _refresh_panel_state() -> void:
         _generate_billboards_button.disabled = not has_biomes or _billboard_generation_running
     if _generate_canopy_button != null:
         _generate_canopy_button.disabled = not has_biomes or _billboard_generation_running
+    if _generate_shadows_button != null:
+        _generate_shadows_button.disabled = not has_biomes or _billboard_generation_running
+    if _generate_mids_button != null:
+        _generate_mids_button.disabled = not has_biomes or _billboard_generation_running
 
     if not has_target:
         _biomes_panel.set_status("Select a Biomes node to edit its mask.")
@@ -950,6 +988,195 @@ func _render_canopy_view(biomes: Biomes, trees: Array[Dictionary], tile: float, 
         return null
     image.convert(Image.FORMAT_RGB8)
     return image
+
+
+func _on_generate_simplified_pressed(kind: Simplified) -> void:
+    if _current_biomes == null or _billboard_generation_running:
+        return
+    _apply_billboard_output_dir_from_ui()
+    _generate_simplified_for_current_biomes.call_deferred(kind)
+
+
+## The edited layer's simplified models of [param kind]: each entry's model of SIMPLIFIED_MIN_TRIANGLES
+## or more simplified (_simplify_surface()), its parts where they stand in the model - a shadow mesh
+## with a material casting the shadow alone, without wind (_shadow_material()), a mid model with the
+## model's own materials; saved as <output dir>/<layer>/<entry>/shadow.tscn or mid.tscn and set as the
+## entry's shadow_scene or mid_scene
+func _generate_simplified_for_current_biomes(kind: Simplified) -> void:
+    if _current_biomes == null:
+        return
+    var biomes := _current_biomes
+    _billboard_generation_running = true
+    _refresh_panel_state()
+    var made := 0
+    var report := PackedStringArray()
+    for index in biomes.entries.size():
+        var entry := biomes.entries[index]
+        if entry == null:
+            continue
+        var source := _instantiate_billboard_source(entry, index)
+        if source.is_empty():
+            continue
+        var found: Array = []
+        _collect_mesh_instances(source["root"], Transform3D.IDENTITY, found)
+        var before := 0
+        for item: Array in found:
+            for surface in (item[0] as MeshInstance3D).mesh.get_surface_count():
+                before += (item[0] as MeshInstance3D).mesh.surface_get_array_index_len(surface) / 3
+        if before < SIMPLIFIED_MIN_TRIANGLES:
+            source["root"].free()
+            continue
+        var model := Node3D.new()
+        model.name = "%s%s" % [String(source["name"]).capitalize().replace(" ", ""), "Shadow" if kind == Simplified.SHADOW else "Mid"]
+        var after := 0
+        for item: Array in found:
+            var source_instance: MeshInstance3D = item[0]
+            var mesh := ArrayMesh.new()
+            for surface in source_instance.mesh.get_surface_count():
+                var simplified: Dictionary = _simplify_surface(source_instance.mesh.surface_get_arrays(surface),
+                        SHADOW_SOLID_SHARE if kind == Simplified.SHADOW else MID_SOLID_SHARE,
+                        SHADOW_CARD_SHARE if kind == Simplified.SHADOW else MID_CARD_SHARE)
+                mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, simplified["arrays"])
+                var material: Material = source_instance.get_active_material(surface)
+                mesh.surface_set_material(mesh.get_surface_count() - 1,
+                        _shadow_material(material, simplified["cards"]) if kind == Simplified.SHADOW else material)
+                after += (simplified["arrays"][Mesh.ARRAY_INDEX] as PackedInt32Array).size() / 3
+            var part := MeshInstance3D.new()
+            part.name = source_instance.name
+            part.transform = item[1]
+            part.mesh = mesh
+            model.add_child(part)
+            part.owner = model
+        source["root"].free()
+        var directory := "%s/%s/%02d_%s" % [_get_billboard_output_root(biomes), _sanitize_asset_name(biomes.name), index, source["name"]]
+        DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(directory))
+        var path := directory.path_join("shadow.tscn" if kind == Simplified.SHADOW else "mid.tscn")
+        var packed := PackedScene.new()
+        if packed.pack(model) == OK and ResourceSaver.save(packed, path) == OK:
+            var saved := ResourceLoader.load(path, "PackedScene", ResourceLoader.CACHE_MODE_REPLACE) as PackedScene
+            if kind == Simplified.SHADOW:
+                entry.shadow_scene = saved
+            else:
+                entry.mid_scene = saved
+            made += 1
+            report.append("%s %d -> %d" % [source["name"], before, after])
+        model.free()
+    await _rescan_filesystem()
+    _billboard_generation_running = false
+    _refresh_panel_state()
+    if is_instance_valid(biomes):
+        biomes.regenerate()
+    _status_label.text = "%s: %d (%s)." % ["Shadow meshes" if kind == Simplified.SHADOW else "Mid meshes", made, ", ".join(report)]
+
+
+## The MeshInstance3Ds under [param node] with their transforms relative to it: [instance, transform]
+func _collect_mesh_instances(node: Node, parent: Transform3D, found: Array) -> void:
+    for child in node.get_children():
+        var local: Transform3D = parent * (child as Node3D).transform if child is Node3D else parent
+        if child is MeshInstance3D and (child as MeshInstance3D).mesh:
+            found.append([child, local])
+        _collect_mesh_instances(child, local, found)
+
+
+## A surface's arrays simplified: {arrays, cards}. Cards (_card_pieces(): many pieces of a few
+## triangles) kept [param card_share] of, evenly, each grown about its middle by sqrt(1 / card_share);
+## a solid surface to the first of Godot's meshoptimizer LODs within [param solid_share] of its
+## triangles. Positions, normals, uvs kept, and tangents - a mid model is lit as the model is.
+static func _simplify_surface(source: Array, solid_share: float, card_share: float) -> Dictionary:
+    var arrays: Array = []
+    arrays.resize(Mesh.ARRAY_MAX)
+    var vertices: PackedVector3Array = source[Mesh.ARRAY_VERTEX]
+    arrays[Mesh.ARRAY_NORMAL] = source[Mesh.ARRAY_NORMAL]
+    arrays[Mesh.ARRAY_TANGENT] = source[Mesh.ARRAY_TANGENT]
+    arrays[Mesh.ARRAY_TEX_UV] = source[Mesh.ARRAY_TEX_UV]
+    var indices: PackedInt32Array = source[Mesh.ARRAY_INDEX]
+    var triangles := indices.size() / 3
+    var pieces := _card_pieces(vertices, indices)
+    var cards := pieces.size() * CARD_TRIANGLES_MAX >= triangles
+    var kept := PackedInt32Array()
+    if cards:
+        var grow := sqrt(1.0 / card_share)
+        var seen := 0
+        for piece: Array in pieces.values():
+            seen += 1
+            # evenly: a card where the running share passes a whole one
+            if floori(seen * card_share) == floori((seen - 1) * card_share):
+                continue
+            var used := {}
+            var middle := Vector3.ZERO
+            for t: int in piece:
+                for k in 3:
+                    used[indices[t + k]] = true
+            for v: int in used:
+                middle += vertices[v]
+            middle /= used.size()
+            for v: int in used:
+                vertices[v] = middle + (vertices[v] - middle) * grow
+            for t: int in piece:
+                kept.append(indices[t])
+                kept.append(indices[t + 1])
+                kept.append(indices[t + 2])
+    else:
+        var importer := ImporterMesh.new()
+        importer.add_surface(Mesh.PRIMITIVE_TRIANGLES, source)
+        importer.generate_lods(SHADOW_NORMAL_MERGE_ANGLE, SHADOW_NORMAL_SPLIT_ANGLE, [])
+        kept = indices
+        for lod in importer.get_surface_lod_count(0):
+            kept = importer.get_surface_lod_indices(0, lod)
+            if kept.size() / 3 <= triangles * solid_share:
+                break
+    arrays[Mesh.ARRAY_VERTEX] = vertices
+    arrays[Mesh.ARRAY_INDEX] = kept
+    return {"arrays": arrays, "cards": cards}
+
+
+## The pieces of a surface: its triangles (their first index) by the piece they belong to, triangles
+## sharing a vertex being of one
+static func _card_pieces(vertices: PackedVector3Array, indices: PackedInt32Array) -> Dictionary:
+    var parent := PackedInt32Array()
+    parent.resize(vertices.size())
+    for v in vertices.size():
+        parent[v] = v
+    var find := func(f: Callable, v: int) -> int:
+        while not parent[v] == v:
+            parent[v] = parent[parent[v]]
+            v = parent[v]
+        return v
+    for t in range(0, indices.size(), 3):
+        var a: int = find.call(find, indices[t])
+        for k in [1, 2]:
+            var b: int = find.call(find, indices[t + k])
+            if not a == b:
+                parent[b] = a
+    var pieces := {}
+    for t in range(0, indices.size(), 3):
+        var piece: int = find.call(find, indices[t])
+        if not pieces.has(piece):
+            pieces[piece] = []
+        pieces[piece].append(t)
+    return pieces
+
+
+## A shadow mesh's material: unshaded, both sides, without wind; a card's cut out of its texture as
+## [param source] cuts it (alpha_scissor_threshold of a shader, or of a BaseMaterial3D)
+static func _shadow_material(source: Material, cards: bool) -> StandardMaterial3D:
+    var material := StandardMaterial3D.new()
+    material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+    material.cull_mode = BaseMaterial3D.CULL_DISABLED
+    if not cards:
+        return material
+    var texture: Texture2D = null
+    var threshold: Variant = null
+    if source is BaseMaterial3D:
+        texture = (source as BaseMaterial3D).albedo_texture
+        threshold = (source as BaseMaterial3D).alpha_scissor_threshold
+    elif source is ShaderMaterial:
+        texture = (source as ShaderMaterial).get_shader_parameter("albedo_texture") as Texture2D
+        threshold = (source as ShaderMaterial).get_shader_parameter("alpha_scissor_threshold")
+    material.albedo_texture = texture
+    material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR
+    material.alpha_scissor_threshold = float(threshold) if threshold != null else SHADOW_ALPHA_SCISSOR_DEFAULT
+    return material
 
 
 func _instantiate_billboard_source(entry: BiomeScatterEntry, entry_index: int) -> Dictionary:
