@@ -59,11 +59,6 @@ var _terrain_edit_timer: Timer
         max_generation_distance = maxf(value, 10.0)
         _queue_configure()
 
-@export_range(1, 64, 1, "or_greater") var chunks_per_frame: int = 4:
-    set(value):
-        chunks_per_frame = maxi(value, 1)
-        _queue_configure()
-
 ## the generation distance follows the scenery draw distance
 ## (SceneryStreamingServer of libmaszyna), up to max_generation_distance_cap
 @export var follow_draw_distance := false:
@@ -142,11 +137,6 @@ var _terrain_edit_timer: Timer
         shadow_casting = clampi(value, GeometryInstance3D.SHADOW_CASTING_SETTING_OFF, GeometryInstance3D.SHADOW_CASTING_SETTING_SHADOWS_ONLY)
         _queue_configure()
 
-@export_enum("Disabled:0", "Static:1", "Dynamic:2") var gi_mode: int = GeometryInstance3D.GI_MODE_DYNAMIC:
-    set(value):
-        gi_mode = clampi(value, GeometryInstance3D.GI_MODE_DISABLED, GeometryInstance3D.GI_MODE_DYNAMIC)
-        _queue_configure()
-
 @export_subgroup("Density LOD")
 @export var density_lod_enabled := false:
     set(value):
@@ -202,22 +192,23 @@ var _terrain_edit_timer: Timer
         far_end = value
         _apply_far_ground()
 
+## the forest's shape past where its trees are drawn: a roof of Far Texture at the height of the
+## trees over the ground the layer grows on, walled by the trees' billboard where it ends - baked
+## with a world's far terrain (BiomesFarCanopy), shown from where this layer's trees end
+@export var far_canopy := false:
+    set(value):
+        far_canopy = value
+        _queue_configure()
+
+## the far canopy's roof: the forest seen from afar on a tile Far Canopy Tile wide, with its clumps
+## and gaps (the Biomes panel's Generate Canopy); without one the roof is Far Texture as the terrain
+## lays it
+@export var far_canopy_texture: Texture2D
+
+## the side of Far Canopy Texture's tile [m]
+@export_range(10.0, 1024.0, 1.0, "or_greater") var far_canopy_tile: float = 128.0
+
 @export_group("Collision")
-@export var generate_chunk_colliders := true:
-    set(value):
-        generate_chunk_colliders = value
-        _queue_configure()
-
-@export_flags_3d_physics var chunk_collision_layer: int = 1:
-    set(value):
-        chunk_collision_layer = value
-        _queue_configure()
-
-@export_flags_3d_physics var chunk_collision_mask: int = 1:
-    set(value):
-        chunk_collision_mask = value
-        _queue_configure()
-
 @export_range(0.1, 1024.0, 0.1, "or_greater") var chunk_size: float = 16.0:
     set(value):
         chunk_size = maxf(value, 0.1)
@@ -318,7 +309,6 @@ func get_config() -> Dictionary:
         "entries": entries.duplicate(),
         "streaming_enabled": streaming_enabled,
         "max_generation_distance": max_generation_distance,
-        "chunks_per_frame": chunks_per_frame,
         "follow_draw_distance": follow_draw_distance,
         "max_generation_distance_cap": max_generation_distance_cap,
         "terrain_texture": terrain_texture,
@@ -343,6 +333,7 @@ func get_config() -> Dictionary:
         "mask_threshold": mask_threshold,
         "mask_inverse": mask_inverse,
         "mask_affects_density": mask_affects_density,
+        "far_canopy": far_canopy,
     }
 
 

@@ -13,6 +13,25 @@ const BILLBOARD_PADDING := 1.15
 const OVERWRITE_SKIP := 0
 const OVERWRITE_OVERWRITE := 1
 const RESOLUTION_PRESETS := [256, 512, 1024]
+## The canopy's tile: the shade between the crowns
+const CANOPY_GAP_COLOR := Color(0.03, 0.045, 0.025)
+## The canopy's tile is the forest seen from this over the horizon [deg] - as it is seen from afar;
+## from above the trees' crossed cards show their edges - from so many sides around, their mean. The
+## roof's from higher: its crowns leant less, its clumps and gaps are not smeared over each other.
+const CANOPY_ELEVATION := 30.0
+const CANOPY_ROOF_ELEVATION := 60.0
+const CANOPY_VIEWS := 8
+## The far canopy's roof tile: pixels as many times the chosen resolution - its tile is far larger
+const CANOPY_ROOF_RESOLUTION := 2
+## The roof tile's forest: the share of its trees standing, around which clumps and gaps go, by whole
+## waves across the tile (x, z) - a few, so it repeats with the tile but not by one wave
+## A mean's channel at least this, as an image is toned by it
+const CANOPY_MEAN_MIN := 0.001
+const CANOPY_CLUMP_DENSITY := 0.75
+const CANOPY_CLUMP_AMPLITUDE := 1.0
+const CANOPY_CLUMP_WAVES: Array[Vector2i] = [Vector2i(1, 2), Vector2i(3, -1), Vector2i(-2, 3), Vector2i(4, 1)]
+## The terrain material's far_albedo_uv_scale when it does not set it (terrain3d_far.gdshader)
+const FAR_ALBEDO_UV_SCALE_DEFAULT := 0.1
 
 var _current_biomes: Biomes
 var _current_paint_target: Node3D
@@ -27,6 +46,7 @@ var _billboard_resolution_option: OptionButton
 var _billboard_output_dir_edit: LineEdit
 var _billboard_output_dir_button: Button
 var _generate_billboards_button: Button
+var _generate_canopy_button: Button
 var _status_label: Label
 var _save_dialog: FileDialog
 var _billboard_dir_dialog: FileDialog
@@ -189,6 +209,12 @@ func _build_panel() -> void:
     _generate_billboards_button.pressed.connect(_on_generate_billboards_pressed)
     _billboard_row.add_child(_generate_billboards_button)
 
+    _generate_canopy_button = Button.new()
+    _generate_canopy_button.text = "Generate Canopy"
+    _generate_canopy_button.tooltip_text = "The layer's trees seen from afar: its Far Texture (canopy.res) and far canopy's roof (canopy_roof.res)"
+    _generate_canopy_button.pressed.connect(_on_generate_canopy_pressed)
+    _billboard_row.add_child(_generate_canopy_button)
+
     _status_label = _biomes_panel.get("status_label")
 
     add_control_to_bottom_panel(_panel, PANEL_TITLE)
@@ -277,6 +303,8 @@ func _refresh_panel_state() -> void:
         _billboard_output_dir_button.disabled = not has_biomes or _billboard_generation_running
     if _generate_billboards_button != null:
         _generate_billboards_button.disabled = not has_biomes or _billboard_generation_running
+    if _generate_canopy_button != null:
+        _generate_canopy_button.disabled = not has_biomes or _billboard_generation_running
 
     if not has_target:
         _biomes_panel.set_status("Select a Biomes node to edit its mask.")
@@ -706,6 +734,222 @@ func _generate_billboard_for_entry(biomes: Biomes, entry: BiomeScatterEntry, ent
     if entry.billboard_lod_distance <= 0.0:
         entry.billboard_lod_distance = 60.0
     return {"status": "generated"}
+
+
+func _on_generate_canopy_pressed() -> void:
+    if _current_biomes == null or _billboard_generation_running:
+        return
+    _apply_billboard_output_dir_from_ui()
+    _generate_canopy_for_current_biomes.call_deferred()
+
+
+## The edited layer's canopies, its trees as a forest is seen from afar (_bake_canopy()): its Far
+## Texture on a tile of the terrain's far texture (1 / far_albedo_uv_scale; canopy.res) and its far
+## canopy's roof on a tile of far_canopy_tile, with the forest's clumps and gaps (canopy_roof.res) -
+## saved with their mipmaps in <output dir>/<layer>/ and set on the layer. Both are toned to the mean
+## colour of the roof's tile seen as the Far Texture is (from CANOPY_ELEVATION, no gaps): the ground
+## the forest stands on afar and the canopy over it alike, the roof's gaps (from higher) its structure
+## and not a darker forest, and the colour of many trees, not of a small tile's few.
+func _generate_canopy_for_current_biomes() -> void:
+    if _current_biomes == null:
+        return
+    var biomes := _current_biomes
+    var material: Object = biomes.terrain.get("material") if biomes.terrain != null else null
+    var uv_scale: Variant = material.get_shader_param("far_albedo_uv_scale") if material != null else null
+    var far_tile := 1.0 / (float(uv_scale) if uv_scale != null and float(uv_scale) > 0.0 else FAR_ALBEDO_UV_SCALE_DEFAULT)
+    var entries: Array[BiomeScatterEntry] = []
+    for entry in biomes.entries:
+        if entry != null and entry.probability > 0.0 and (entry.mesh_scene != null or entry.mesh != null):
+            entries.append(entry)
+    if entries.is_empty():
+        _status_label.text = "Canopy: %s has no trees." % biomes.name
+        return
+    _billboard_generation_running = true
+    _refresh_panel_state()
+    _status_label.text = "Generating the canopy of %s..." % biomes.name
+    var resolution := _billboard_resolution_option.get_selected_id()
+    var directory := "%s/%s" % [_get_billboard_output_root(biomes), _sanitize_asset_name(biomes.name)]
+    DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(directory))
+    var far_path := directory.path_join("canopy.res")
+    var roof_path := directory.path_join("canopy_roof.res")
+    var colour: Image = await _bake_canopy(biomes, entries, biomes.far_canopy_tile, resolution, CANOPY_ELEVATION, false)
+    var far: Image = await _bake_canopy(biomes, entries, far_tile, resolution, CANOPY_ELEVATION, false)
+    var roof: Image = await _bake_canopy(biomes, entries, biomes.far_canopy_tile, resolution * CANOPY_ROOF_RESOLUTION,
+            CANOPY_ROOF_ELEVATION, true)
+    var saved := colour != null and far != null and roof != null
+    if saved:
+        var target := _image_mean(colour)
+        for bake: Array in [[far, far_path], [roof, roof_path]]:
+            var image: Image = bake[0]
+            var mean := _image_mean(image)
+            var toned := image.get_data()
+            for index in toned.size():
+                toned[index] = clampi(roundi(toned[index] * target[index % 3] / maxf(mean[index % 3], CANOPY_MEAN_MIN)), 0, 255)
+            image.set_data(image.get_width(), image.get_height(), false, Image.FORMAT_RGB8, toned)
+            image.generate_mipmaps()
+            image.compress(Image.COMPRESS_S3TC)
+            saved = saved and ResourceSaver.save(ImageTexture.create_from_image(image), bake[1], ResourceSaver.FLAG_COMPRESS) == OK
+    await _rescan_filesystem()
+    _billboard_generation_running = false
+    _refresh_panel_state()
+    if not saved or not is_instance_valid(biomes):
+        _status_label.text = "Canopy: could not save %s." % directory
+        return
+    biomes.far_texture = ResourceLoader.load(far_path, "Texture2D", ResourceLoader.CACHE_MODE_REPLACE) as Texture2D
+    biomes.far_canopy_texture = ResourceLoader.load(roof_path, "Texture2D", ResourceLoader.CACHE_MODE_REPLACE) as Texture2D
+    _status_label.text = "Canopy: %s and %s set on %s." % [far_path.get_file(), roof_path.get_file(), biomes.name]
+
+
+## A tile [param tile] wide of the layer's [param entries] seen from [param elevation] over the
+## horizon [deg], the mean of CANOPY_VIEWS sides (_render_canopy_view()), [param resolution] pixels a side,
+## RGB8: a tree a cell of a grid of the spacing, jittered in it (randomly placed, a few left a band
+## without one across the tile - stripes from afar), its entry by probability as the server picks
+## them; with [param clumps], left out where a forest's density is low (_clump_density()) - its gaps
+## and clumps, repeating with the tile. Null when nothing was rendered.
+func _bake_canopy(biomes: Biomes, entries: Array[BiomeScatterEntry], tile: float, resolution: int, elevation: float,
+        clumps: bool) -> Image:
+    var total := 0.0
+    for entry in entries:
+        total += entry.probability
+    # each entry's bounds, unscaled
+    var bounds: Dictionary = {}
+    for entry in entries:
+        var source := _instantiate_billboard_source(entry, biomes.entries.find(entry))
+        var found := _compute_scene_bounds(source["root"])
+        source["root"].free()
+        bounds[entry] = found["aabb"] if bool(found.get("has_bounds", false)) else AABB()
+    var rng := RandomNumberGenerator.new()
+    rng.seed = biomes.seed
+    var waves: Array[Vector3] = []
+    for wave: Vector2i in CANOPY_CLUMP_WAVES:
+        waves.append(Vector3(wave.x, wave.y, rng.randf() * TAU))
+    var side := maxi(1, roundi(tile / biomes.average_spacing))
+    var cell := tile / side
+    var trees: Array[Dictionary] = []
+    for tree in side * side:
+        var at := Vector3((tree % side + rng.randf_range(0.2, 0.8)) * cell - tile * 0.5, 0.0,
+                (tree / side + rng.randf_range(0.2, 0.8)) * cell - tile * 0.5)
+        var pick := rng.randf() * total
+        var keep := rng.randf()
+        if clumps and keep > _clump_density(waves, at, tile):
+            continue
+        var entry: BiomeScatterEntry = entries.back()
+        for candidate in entries:
+            pick -= candidate.probability
+            if pick <= 0.0:
+                entry = candidate
+                break
+        var scale := Vector3(rng.randf_range(entry.scale_min.x, entry.scale_max.x),
+                rng.randf_range(entry.scale_min.y, entry.scale_max.y), rng.randf_range(entry.scale_min.z, entry.scale_max.z))
+        var aabb: AABB = bounds[entry]
+        trees.append({"entry": entry, "place": Transform3D(Basis.IDENTITY.rotated(Vector3.UP, rng.randf() * TAU).scaled(scale), at),
+                "height": aabb.end.y * scale.y, "radius": maxf(aabb.size.x * scale.x, aabb.size.z * scale.z) * 0.5})
+    var views: Array[Image] = []
+    for view in CANOPY_VIEWS:
+        var image := await _render_canopy_view(biomes, trees, tile, resolution, elevation, TAU * view / CANOPY_VIEWS)
+        if image != null:
+            views.append(image)
+    if views.is_empty():
+        return null
+    # the views' mean, drawn over each other: the k-th at 1 / (k + 1)
+    var viewport := SubViewport.new()
+    viewport.size = Vector2i(resolution, resolution)
+    viewport.render_target_update_mode = SubViewport.UPDATE_ONCE
+    add_child(viewport)
+    for index in views.size():
+        var layer := TextureRect.new()
+        layer.texture = ImageTexture.create_from_image(views[index])
+        layer.size = Vector2(resolution, resolution)
+        layer.modulate.a = 1.0 / (index + 1)
+        viewport.add_child(layer)
+    await get_tree().process_frame
+    await RenderingServer.frame_post_draw
+    var mean := viewport.get_texture().get_image()
+    viewport.queue_free()
+    mean.convert(Image.FORMAT_RGB8)
+    return mean
+
+
+## An RGB8 image's mean colour
+static func _image_mean(image: Image) -> Color:
+    var pixel := image.duplicate() as Image
+    pixel.resize(1, 1, Image.INTERPOLATE_TRILINEAR)
+    return pixel.get_pixel(0, 0)
+
+
+## The share of a forest's trees standing at [param at] (a tile [param tile] wide): around
+## CANOPY_CLUMP_DENSITY, by [param waves] - whole waves across the tile (x, z) at a phase (the third),
+## so the clumps and gaps repeat with it
+static func _clump_density(waves: Array[Vector3], at: Vector3, tile: float) -> float:
+    var wave_sum := 0.0
+    for wave: Vector3 in waves:
+        wave_sum += sin(TAU * (wave.x * at.x + wave.y * at.z) / tile + wave.z)
+    return CANOPY_CLUMP_DENSITY + CANOPY_CLUMP_AMPLITUDE * wave_sum / waves.size()
+
+
+## A tile of [param trees] seen from [param elevation] over the horizon [deg], from the side [param heading]
+## (around Y): straight down on the trees leant away from it - sheared, a point's height moving it
+## along the ground - so the ground stays where it is and the tile repeats; a tree is also drawn a
+## tile away where its lean or its crown reaches over the tile's side. RGB8, the image's rows along
+## +Z (the terrain's v); null when nothing was rendered.
+func _render_canopy_view(biomes: Biomes, trees: Array[Dictionary], tile: float, resolution: int, elevation: float,
+        heading: float) -> Image:
+    var viewport := SubViewport.new()
+    viewport.size = Vector2i(resolution, resolution)
+    viewport.render_target_update_mode = SubViewport.UPDATE_ONCE
+    viewport.msaa_3d = Viewport.MSAA_4X
+    viewport.own_world_3d = true
+    viewport.debug_draw = Viewport.DEBUG_DRAW_UNSHADED
+    add_child(viewport)
+    var scene_root := Node3D.new()
+    viewport.add_child(scene_root)
+    var environment := Environment.new()
+    environment.background_mode = Environment.BG_COLOR
+    environment.background_color = CANOPY_GAP_COLOR
+    var world_environment := WorldEnvironment.new()
+    world_environment.environment = environment
+    scene_root.add_child(world_environment)
+
+    var lean := Vector3(sin(heading), 0.0, cos(heading)) / tan(deg_to_rad(elevation))
+    var shear := Transform3D(Basis(Vector3.RIGHT, Vector3.UP + lean, Vector3.BACK), Vector3.ZERO)
+    var top := 0.0
+    for tree: Dictionary in trees:
+        var entry: BiomeScatterEntry = tree["entry"]
+        var place: Transform3D = tree["place"]
+        top = maxf(top, tree["height"])
+        var margin: float = tree["height"] * lean.length() + tree["radius"]
+        var reach := ceili(margin / tile) + 1
+        for dz in range(-reach, reach + 1):
+            for dx in range(-reach, reach + 1):
+                var at := place.origin + Vector3(dx * tile, 0.0, dz * tile)
+                if absf(at.x) > tile * 0.5 + margin or absf(at.z) > tile * 0.5 + margin:
+                    continue
+                var copy := _instantiate_billboard_source(entry, biomes.entries.find(entry))
+                var holder := Node3D.new()
+                holder.transform = Transform3D(Basis.IDENTITY, Vector3(dx * tile, 0.0, dz * tile)) * shear * place
+                scene_root.add_child(holder)
+                holder.add_child(copy["root"])
+
+    # straight down, the image's rows along +Z as the terrain's far texture lays it (its v along Z)
+    var camera := Camera3D.new()
+    camera.projection = Camera3D.PROJECTION_ORTHOGONAL
+    camera.keep_aspect = Camera3D.KEEP_HEIGHT
+    camera.size = tile
+    camera.near = 0.05
+    camera.far = top + 20.0
+    camera.position = Vector3(0.0, top + 10.0, 0.0)
+    camera.rotation = Vector3(-PI * 0.5, 0.0, 0.0)
+    scene_root.add_child(camera)
+    camera.current = true
+
+    await get_tree().process_frame
+    await RenderingServer.frame_post_draw
+    var image := viewport.get_texture().get_image()
+    viewport.queue_free()
+    if image == null or image.is_empty():
+        return null
+    image.convert(Image.FORMAT_RGB8)
+    return image
 
 
 func _instantiate_billboard_source(entry: BiomeScatterEntry, entry_index: int) -> Dictionary:

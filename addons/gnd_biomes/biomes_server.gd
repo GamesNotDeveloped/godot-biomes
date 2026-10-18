@@ -3,9 +3,13 @@ extends Node
 ## BiomesServer (autoload): grows the biomes. A node describes a kind of biome and hands it to the
 ## server; the server grows it around the camera, with RenderingServer's objects alone - no nodes:
 ## - a scatter (Biomes: models - trees, flowers - over an area, on a texture of its terrain;
-##   scatter_create(), scatter_configure()): a chunk at a time, its points worked out on the worker
-##   threads, stood on the terrain and drawn as MultiMeshes (a near one and a billboard one per model
-##   part); the chunks are planned on a timer (STREAM_INTERVAL), never per frame;
+##   scatter_create(), scatter_configure()): a chunk at a time, worked out on the worker threads -
+##   its points, on a terrain stood on it and their MultiMeshes' buffers too, from the maps of its
+##   regions taken for the task (_terrain_job()) - and drawn as MultiMeshes (a near one and a
+##   billboard one per model part) on the main thread; the chunks are planned on a timer
+##   (STREAM_INTERVAL), never per frame. Where a forest's
+##   trees end its canopy baked with the world (BiomesFarCanopy) shows: its layer's distance is
+##   CANOPY_BEGIN_PARAMETER;
 ## - grass (BiomesGrass: blades - grass, grain - on textures of its terrain; grass_create(),
 ##   grass_configure()): a grid of GPU particles placed by the process material from the terrain's
 ##   maps, moved after the camera - the one thing looked at every frame, while there is grass.
@@ -13,9 +17,6 @@ extends Node
 const BILLBOARD_SHADER: Shader = preload("./billboard.gdshader")
 ## How often the camera is looked at and the chunks planned [s]
 const STREAM_INTERVAL: float = 0.1
-## The frames of a STREAM_INTERVAL at 60 fps: a biome builds its chunks_per_frame per frame, so many
-## times that a tick
-const STREAM_FRAMES: int = 6
 ## terrain_texture of a biome growing on any texture
 const TERRAIN_TEXTURE_ANYWHERE: int = -1
 ## Terrain3D's autoshader defaults, of a material that does not set them
@@ -26,7 +27,20 @@ const AUTO_BASE_TEXTURE_DEFAULT: int = 0
 const AUTO_OVERLAY_TEXTURE_DEFAULT: int = 1
 ## Terrain3D shows the overlay texture where it is blended over this
 const OVERLAY_BLEND_SHOWN: float = 0.5
+## Terrain3D's control map (terrain_3d_util.h): an autoshaded and a hole vertex's bits
+const CONTROL_AUTO: int = 0x1
+const CONTROL_HOLE: int = 0x4
+## Terrain3D's control map's base and overlay texture ids and blend: their bits' place and width
+const CONTROL_BASE_SHIFT: int = 27
+const CONTROL_OVERLAY_SHIFT: int = 22
+const CONTROL_ID_MASK: int = 0x1F
+const CONTROL_BLEND_SHIFT: int = 14
+const CONTROL_BLEND_MASK: int = 0xFF
 const HASH_MASK: int = 0xFFFFFFFF
+## The chunks a biome has the worker threads work out at once, the nearest first
+const CHUNK_TASKS: int = 16
+## The main thread's time a frame for making the chunks the worker threads have done [us]
+const CHUNK_MAKE_BUDGET_USEC: int = 1000
 ## Floats of an instance's transform in a MultiMesh buffer (3x4)
 const TRANSFORM_FLOATS: int = 12
 ## Grass: a particle lives this long - the grid restarts it whenever it moves [s]
@@ -35,6 +49,9 @@ const PARTICLES_LIFETIME: float = 600.0
 const REGION_MAP_SIZE: int = 32
 ## The project's global shader parameter that turns the biomes' shadows off when false
 const HIGH_QUALITY_PARAMETER: StringName = &"gnd_high_quality_foliage"
+## The global shader parameter of the far canopy (BiomesFarCanopy, far_canopy.gdshader): from how far
+## it shows - where the trees of the layer with far_canopy end [m]
+const CANOPY_BEGIN_PARAMETER: StringName = &"gnd_canopy_begin"
 
 enum MaskChannel { RED, GREEN, BLUE, ALPHA, LUMINANCE }
 ## What grows where the terrain's autoshader is on - nothing, as on the texture painted there, or
@@ -78,11 +95,22 @@ class Scatter:
     var chunks: Dictionary = {}
     ## chunk coords -> WorkerThreadPool task id
     var tasks: Dictionary = {}
-    ## chunk coords -> Array of points, written by the worker threads
+    ## chunk coords -> what the worker threads worked out: on a terrain the chunk grown
+    ## (_grow_chunk()), without one an Array of its points (_generate_points())
     var points: Dictionary = {}
     var mutex: Mutex = Mutex.new()
     ## Raised by every configuration: a task of an earlier one leaves its points unused
     var generation: int = 0
+    ## Raised whenever the terrain's maps change (regions streamed in): a chunk grown on the maps of
+    ## before where a region was missing is let go of and grows again
+    var terrain_stamp: int = 0
+    ## The chunks around the camera's chunk to grow: their offsets from it, nearest first - planned
+    ## when the distance or the chunk's size changes (plan: [distance, size]), the same wherever the
+    ## camera is - the camera's chunk, and the next offset to look at
+    var offsets: Array[Vector2i] = []
+    var plan: Array = []
+    var center: Vector2i = Vector2i.MAX
+    var next: int = 0
     var high_quality: bool = true
 
 
@@ -91,6 +119,11 @@ var _scatters: Dictionary = {}
 var _grasses: Dictionary = {}
 var _timer: Timer
 var _high_quality: bool = true
+## The far canopy's distance set last (CANOPY_BEGIN_PARAMETER)
+var _canopy_begin: float = -1.0
+## The chunks the worker threads have done, to be made: [scatter, coords, generation] - made a
+## frame's CHUNK_MAKE_BUDGET_USEC at a time while there are any (_make_done_chunks())
+var _done: Array[Array] = []
 
 
 ## The foliage's quality (HIGH_QUALITY_PARAMETER, which the shaders read too): shadows and detail of
@@ -109,6 +142,11 @@ func _ready() -> void:
     # (in a game it logs an error at every call)
     var declared: Variant = ProjectSettings.get_setting("shader_globals/" + HIGH_QUALITY_PARAMETER)
     _high_quality = bool(declared.get("value", true)) if declared is Dictionary else true
+    # the far canopy's shader reads it: there before any world's far terrain is loaded, in a
+    # project that does not declare it
+    if not ProjectSettings.has_setting("shader_globals/" + CANOPY_BEGIN_PARAMETER):
+        RenderingServer.global_shader_parameter_add(CANOPY_BEGIN_PARAMETER,
+                RenderingServer.GLOBAL_VAR_TYPE_FLOAT, 0.0)
     _timer = Timer.new()
     _timer.wait_time = STREAM_INTERVAL
     _timer.timeout.connect(_stream)
@@ -178,9 +216,11 @@ func _on_terrain_maps_changed() -> void:
                 RenderingServer.particles_set_custom_aabb(particles, aabb)
             _set_process_parameters(grass, grass.last_position.snapped(Vector3.ONE))
     for scatter: Scatter in _scatters.values():
+        scatter.terrain_stamp += 1
         for coords: Vector2i in scatter.chunks.keys():
             if scatter.chunks[coords]["missing"]:
                 _drop_chunk(scatter, coords)
+        scatter.next = 0
 
 
 ## The blades' settings (BiomesGrass.get_config()); the grid is made again
@@ -392,6 +432,7 @@ func _clear(scatter: Scatter) -> void:
     scatter.generation += 1
     for coords: Vector2i in scatter.chunks.keys():
         _drop_chunk(scatter, coords)
+    scatter.plan = []
 
 
 func _wait_for_tasks(scatter: Scatter) -> void:
@@ -434,70 +475,146 @@ func _stream() -> void:
             scatter.high_quality = _high_quality
             _apply_shadows(scatter)
         _stream_scatter(scatter, camera.global_position)
+        if scatter.config.get("far_canopy", false):
+            var begin: float = _generation_distance(scatter.config)
+            if not begin == _canopy_begin:
+                _canopy_begin = begin
+                RenderingServer.global_shader_parameter_set(CANOPY_BEGIN_PARAMETER, begin)
 
 
+## How far the biome's chunks grow from the camera [m]
+static func _generation_distance(config: Dictionary) -> float:
+    if config["follow_draw_distance"] and Engine.has_singleton(&"SceneryStreamingServer"):
+        return minf(Engine.get_singleton(&"SceneryStreamingServer").streaming_get_draw_distance(),
+                config["max_generation_distance_cap"])
+    return config["max_generation_distance"]
+
+
+## The biome's chunks within its distance of the camera grown, nearest first: CHUNK_TASKS at once
+## worked out on the worker threads, each made as soon as it is done (_chunk_done()), which hands out
+## the next; as the camera enters another chunk the ones out of the distance dropped
 func _stream_scatter(scatter: Scatter, camera_position: Vector3) -> void:
     var config: Dictionary = scatter.config
     var size: float = config["chunk_size"]
     var camera_local: Vector3 = scatter.transform.affine_inverse() * camera_position
     var camera_chunk: Vector2i = Vector2i(floori(camera_local.x / size), floori(camera_local.z / size))
-    var distance: float = config["max_generation_distance"]
-    if config["follow_draw_distance"] and Engine.has_singleton(&"SceneryStreamingServer"):
-        distance = minf(Engine.get_singleton(&"SceneryStreamingServer").streaming_get_draw_distance(),
-                config["max_generation_distance_cap"])
-    var radius: int = ceili(distance / size)
-    # no chunk outside area_size
-    var half_area: Vector2 = config["area_size"] * 0.5
-    var area_min: Vector2i = Vector2i(floori(-half_area.x / size), floori(-half_area.y / size))
-    var area_max: Vector2i = Vector2i(ceili(half_area.x / size) - 1, ceili(half_area.y / size) - 1)
-    var needed: Dictionary = {}
-    var order: Array[Vector2i] = []
-    for x in range(maxi(camera_chunk.x - radius, area_min.x), mini(camera_chunk.x + radius, area_max.x) + 1):
-        for z in range(maxi(camera_chunk.y - radius, area_min.y), mini(camera_chunk.y + radius, area_max.y) + 1):
-            var coords: Vector2i = Vector2i(x, z)
-            var center: Vector3 = _chunk_center(coords, size)
-            if Vector2(camera_local.x, camera_local.z).distance_to(Vector2(center.x, center.z)) <= distance:
-                needed[coords] = true
-                order.append(coords)
-    order.sort_custom(func(a: Vector2i, b: Vector2i) -> bool:
-        return (a - camera_chunk).length_squared() < (b - camera_chunk).length_squared())
-    for coords: Vector2i in scatter.chunks.keys():
-        if not needed.has(coords):
-            _drop_chunk(scatter, coords)
-    # a task of a chunk no longer needed is let go of once done, with its points
-    for coords: Vector2i in scatter.tasks.keys():
-        if not needed.has(coords) and WorkerThreadPool.is_task_completed(scatter.tasks[coords]):
-            WorkerThreadPool.wait_for_task_completion(scatter.tasks[coords])
-            scatter.tasks.erase(coords)
-            scatter.mutex.lock()
-            scatter.points.erase(coords)
-            scatter.mutex.unlock()
-
-    var built: int = 0
-    for coords: Vector2i in order:
-        if scatter.chunks.has(coords):
-            continue
-        if not scatter.tasks.has(coords):
-            var generation: int = scatter.generation
-            scatter.tasks[coords] = WorkerThreadPool.add_task(_generate_points.bind(scatter, coords, generation))
-            continue
-        if built >= config["chunks_per_frame"] * STREAM_FRAMES or not WorkerThreadPool.is_task_completed(scatter.tasks[coords]):
-            continue
-        WorkerThreadPool.wait_for_task_completion(scatter.tasks[coords])
-        scatter.tasks.erase(coords)
-        scatter.mutex.lock()
-        var points: Array = scatter.points.get(coords, [])
-        scatter.points.erase(coords)
-        scatter.mutex.unlock()
-        _build_chunk(scatter, coords, points)
-        built += 1
+    var distance: float = _generation_distance(config)
+    if not scatter.plan == [distance, size]:
+        _plan_chunks(scatter, distance, size)
+    if not scatter.center == camera_chunk:
+        scatter.center = camera_chunk
+        scatter.next = 0
+        for coords: Vector2i in scatter.chunks.keys():
+            if not _chunk_needed(scatter, coords, distance, size):
+                _drop_chunk(scatter, coords)
+    _hand_out_chunks(scatter)
     if config["density_lod_enabled"]:
         _apply_density(scatter, camera_local)
 
 
-## On a worker thread: the candidate points of a chunk - one per cell of the spacing, jittered by a
-## hash of the cell, kept by the mask's density, given an entry, a scale and a turn
+## The next chunks to grow handed to the worker threads, nearest first, up to CHUNK_TASKS at once
+func _hand_out_chunks(scatter: Scatter) -> void:
+    var distance: float = scatter.plan[0]
+    var size: float = scatter.plan[1]
+    var terrain: Node3D = instance_from_id(scatter.terrain_id) as Node3D if scatter.terrain_id else null
+    while scatter.tasks.size() < CHUNK_TASKS and scatter.next < scatter.offsets.size():
+        var coords: Vector2i = scatter.center + scatter.offsets[scatter.next]
+        scatter.next += 1
+        if scatter.chunks.has(coords) or scatter.tasks.has(coords) or not _chunk_needed(scatter, coords, distance, size):
+            continue
+        var generation: int = scatter.generation
+        scatter.tasks[coords] = WorkerThreadPool.add_task(
+                _grow_chunk.bind(scatter, coords, generation, _terrain_job(scatter, terrain, coords)) if terrain \
+                else _generate_points.bind(scatter, coords, generation))
+
+
+## On the main thread, called by a worker thread as its chunk is done: the chunk queued to be made
+## (_make_done_chunks()), the frames followed while any is
+func _chunk_done(scatter: Scatter, coords: Vector2i, generation: int) -> void:
+    if _done.is_empty():
+        get_tree().process_frame.connect(_make_done_chunks)
+    _done.append([scatter, coords, generation])
+
+
+## A frame's work while the worker threads' chunks wait: as many made as CHUNK_MAKE_BUDGET_USEC lets
+## (_make_done_chunk()), the frames let go of once none is left
+func _make_done_chunks() -> void:
+    var deadline: int = Time.get_ticks_usec() + CHUNK_MAKE_BUDGET_USEC
+    while _done and Time.get_ticks_usec() < deadline:
+        var done: Array = _done.pop_front()
+        _make_done_chunk(done[0], done[1], done[2])
+    if _done.is_empty():
+        get_tree().process_frame.disconnect(_make_done_chunks)
+
+
+## The chunk a worker thread has done made, or let go of when no longer needed, out of date or grown
+## on maps of before; the next one handed out. Nothing when the biome let its tasks go meanwhile
+## (_clear(), scatter_free()).
+func _make_done_chunk(scatter: Scatter, coords: Vector2i, generation: int) -> void:
+    if not scatter.tasks.has(coords) or not generation == scatter.generation:
+        return
+    WorkerThreadPool.wait_for_task_completion(scatter.tasks[coords])
+    scatter.tasks.erase(coords)
+    scatter.mutex.lock()
+    var worked: Variant = scatter.points.get(coords, [])
+    scatter.points.erase(coords)
+    scatter.mutex.unlock()
+    if _chunk_needed(scatter, coords, scatter.plan[0], scatter.plan[1]):
+        if worked is Dictionary:
+            # grown where a region was missing on the maps of before: it grows again on the new ones
+            if worked["missing"] and not worked["terrain_stamp"] == scatter.terrain_stamp:
+                scatter.next = 0
+            else:
+                _make_chunk(scatter, coords, worked)
+        else:
+            _build_chunk(scatter, coords, worked)
+    _hand_out_chunks(scatter)
+
+
+## The chunks' offsets from the camera's chunk within [param distance] of it (their middles' from the
+## camera's chunk's), nearest first (offsets)
+func _plan_chunks(scatter: Scatter, distance: float, size: float) -> void:
+    var radius: int = ceili(distance / size)
+    var found: Array[Vector2i] = []
+    # nearest first: an offset's squared length above its index in found, sorted natively
+    var keys: PackedInt64Array = PackedInt64Array()
+    for x in range(-radius, radius + 1):
+        for z in range(-radius, radius + 1):
+            if Vector2(x, z).length() * size <= distance:
+                keys.append((Vector2i(x, z).length_squared() << 32) | found.size())
+                found.append(Vector2i(x, z))
+    keys.sort()
+    scatter.offsets.clear()
+    for key: int in keys:
+        scatter.offsets.append(found[key & HASH_MASK])
+    scatter.plan = [distance, size]
+    scatter.center = Vector2i.MAX
+
+
+## Whether the chunk [param coords] is to be grown: within [param distance] of the camera's chunk
+## (scatter.center) and within the biome's area_size
+static func _chunk_needed(scatter: Scatter, coords: Vector2i, distance: float, size: float) -> bool:
+    var half_area: Vector2 = scatter.config["area_size"] * 0.5
+    var middle: Vector2 = (Vector2(coords) + Vector2(0.5, 0.5)) * size
+    if absf(middle.x) - size * 0.5 > half_area.x or absf(middle.y) - size * 0.5 > half_area.y:
+        return false
+    return Vector2(coords - scatter.center).length() * size <= distance
+
+
+## On a worker thread: the candidate points of a chunk (_chunk_points()), stood on the surface by
+## the main thread (_build_chunk()) - without a terrain
 func _generate_points(scatter: Scatter, coords: Vector2i, generation: int) -> void:
+    var points: Array = _chunk_points(scatter, coords)
+    scatter.mutex.lock()
+    if generation == scatter.generation:
+        scatter.points[coords] = points
+    scatter.mutex.unlock()
+    _chunk_done.call_deferred(scatter, coords, generation)
+
+
+## The candidate points of a chunk - one per cell of the spacing, jittered by a hash of the cell,
+## kept by the mask's density, given an entry, a scale and a turn
+static func _chunk_points(scatter: Scatter, coords: Vector2i) -> Array:
     var config: Dictionary = scatter.config
     var seed_value: int = config["seed"]
     var size: float = config["chunk_size"]
@@ -532,10 +649,188 @@ func _generate_points(scatter: Scatter, coords: Vector2i, generation: int) -> vo
             points.append({"position": Vector3(x, 0.0, z), "scale": scale,
                     "yaw": TAU * _hash01(seed_value, cell_x, cell_z, 37), "entry": entry,
                     "priority": _hash01(seed_value, cell_x, cell_z, 53)})
+    return points
+
+
+## On the main thread: what a chunk grown on [param terrain] is worked out of on a worker thread
+## (_grow_chunk()), all of it the task's own - the maps of the terrain's regions under the chunk (a
+## region taken out of the terrain meanwhile keeps its maps for the task) and how the biome reads them
+func _terrain_job(scatter: Scatter, terrain: Node3D, coords: Vector2i) -> Dictionary:
+    var config: Dictionary = scatter.config
+    var spacing: float = terrain.vertex_spacing
+    var region_size: int = terrain.region_size
+    var size: float = config["chunk_size"]
+    var corner: Vector2 = Vector2(coords) * size
+    var a: Vector3 = scatter.transform * Vector3(corner.x, 0.0, corner.y)
+    var b: Vector3 = scatter.transform * Vector3(corner.x + size, 0.0, corner.y + size)
+    # the vertices read: a vertex more around for the heights between vertices and the slopes
+    var first: Vector2i = Vector2i(floori(minf(a.x, b.x) / spacing) - 1, floori(minf(a.z, b.z) / spacing) - 1)
+    var last: Vector2i = Vector2i(ceili(maxf(a.x, b.x) / spacing) + 2, ceili(maxf(a.z, b.z) / spacing) + 2)
+    var regions: Dictionary = {}
+    for x in range(floori(float(first.x) / region_size), floori(float(last.x) / region_size) + 1):
+        for z in range(floori(float(first.y) / region_size), floori(float(last.y) / region_size) + 1):
+            var region: Object = terrain.data.get_region(Vector2i(x, z))
+            if region and not region.is_deleted():
+                regions[Vector2i(x, z)] = [region.get_height_map(), region.get_control_map()]
+    var job: Dictionary = {"spacing": spacing, "region_size": region_size, "regions": regions,
+            "vertices": Rect2i(first, last - first + Vector2i.ONE), "terrain_stamp": scatter.terrain_stamp,
+            "auto_shader": terrain.material.get_auto_shader()}
+    for parameter: Array in [["auto_slope", AUTO_SLOPE_DEFAULT], ["auto_height_reduction", AUTO_HEIGHT_REDUCTION_DEFAULT],
+            ["auto_base_texture", AUTO_BASE_TEXTURE_DEFAULT], ["auto_overlay_texture", AUTO_OVERLAY_TEXTURE_DEFAULT]]:
+        job[parameter[0]] = _material_param(terrain, parameter[0], parameter[1])
+    return job
+
+
+## On a worker thread: a chunk grown on the job's maps (_terrain_job()) - its points
+## (_chunk_points()) stood on the terrain where it grows on the biome's texture, and per entry and
+## model part the buffer of a near MultiMesh, and of a billboard one past the entry's
+## billboard_lod_distance; the main thread only makes them (_make_chunk())
+func _grow_chunk(scatter: Scatter, coords: Vector2i, generation: int, job: Dictionary) -> void:
+    var config: Dictionary = scatter.config
+    var maps: Dictionary = _terrain_maps(job)
+    var inverse: Transform3D = scatter.transform.affine_inverse()
+    var center: Vector3 = _chunk_center(coords, config["chunk_size"])
+    var texture_needed: bool = not config["terrain_texture"] == TERRAIN_TEXTURE_ANYWHERE
+    # entry index -> [entry, transforms (local), priorities]
+    var buckets: Dictionary = {}
+    # a point where the terrain has no region yet: the chunk grows again when its maps change
+    var missing: bool = false
+    for point: Dictionary in _chunk_points(scatter, coords):
+        var global: Vector3 = scatter.transform * (point["position"] as Vector3)
+        var height: float = _map_height(job, maps, global.x, global.z)
+        if is_nan(height):
+            missing = true
+            continue
+        if texture_needed and not _map_texture(job, maps, config, global.x, global.z) == config["terrain_texture"]:
+            continue
+        var entry: Dictionary = point["entry"]
+        if not buckets.has(entry["index"]):
+            buckets[entry["index"]] = [entry, [], []]
+        buckets[entry["index"]][1].append(Transform3D(Basis.IDENTITY.rotated(Vector3.UP, point["yaw"]).scaled(point["scale"]),
+                inverse * Vector3(global.x, height, global.z)))
+        buckets[entry["index"]][2].append(point["priority"])
+    # per part: [mesh, buffer, instances, range begin, range end]
+    var parts: Array = []
+    var count: int = 0
+    for bucket: Array in buckets.values():
+        var entry: Dictionary = bucket[0]
+        # the instances in the order the density LOD drops them: the highest priority last
+        var order: Array = range(bucket[1].size())
+        order.sort_custom(func(a: int, b: int) -> bool: return bucket[2][a] < bucket[2][b])
+        var transforms: Array[Transform3D] = []
+        for index: int in order:
+            transforms.append(bucket[1][index])
+        var lod: float = entry["billboard_lod_distance"]
+        var billboards: Array = entry["billboard_parts"]
+        for part: Dictionary in entry["main_parts"]:
+            if part["mesh"]:
+                parts.append([part["mesh"], _part_buffer(transforms, part["transform"], center), transforms.size(),
+                        0.0, lod if billboards and lod > 0.0 else 0.0])
+        for part: Dictionary in billboards:
+            if part["mesh"]:
+                parts.append([part["mesh"], _part_buffer(transforms, part["transform"], center), transforms.size(),
+                        lod if lod > 0.0 else 0.0, 0.0])
+        count += transforms.size()
     scatter.mutex.lock()
     if generation == scatter.generation:
-        scatter.points[coords] = points
+        scatter.points[coords] = {"parts": parts, "count": count, "center": center, "missing": missing,
+                "terrain_stamp": job["terrain_stamp"]}
     scatter.mutex.unlock()
+    _chunk_done.call_deferred(scatter, coords, generation)
+
+
+## On the main thread: the chunk grown (_grow_chunk()) drawn - a MultiMesh and its instance a part
+func _make_chunk(scatter: Scatter, coords: Vector2i, grown: Dictionary) -> void:
+    var center: Vector3 = grown["center"]
+    var chunk: Dictionary = {"multimeshes": [], "instances": [], "lods": [], "count": grown["count"], "visible": -1,
+            "center": center, "missing": grown["missing"]}
+    var chunk_transform: Transform3D = scatter.transform * Transform3D(Basis.IDENTITY, center)
+    for part: Array in grown["parts"]:
+        _add_multimesh(scatter, chunk, chunk_transform, part[0], part[1], part[2], part[3], part[4])
+    scatter.chunks[coords] = chunk
+
+
+## The job's maps cut to the vertices it reads: region location -> [first vertex (global), width,
+## heights (PackedFloat32Array), controls (PackedInt32Array, the bits as they are), height]
+static func _terrain_maps(job: Dictionary) -> Dictionary:
+    var maps: Dictionary = {}
+    var region_size: int = job["region_size"]
+    var wanted: Rect2i = job["vertices"]
+    for location: Vector2i in job["regions"]:
+        var origin: Vector2i = location * region_size
+        var part: Rect2i = wanted.intersection(Rect2i(origin, Vector2i(region_size, region_size)))
+        if not part.has_area():
+            continue
+        var local: Rect2i = Rect2i(part.position - origin, part.size)
+        var height_map: Image = job["regions"][location][0]
+        var control_map: Image = job["regions"][location][1]
+        # the control map's bits as they are: a pixel read as a float may be a NaN, which loses bits
+        maps[location] = [part.position, part.size.x, height_map.get_region(local).get_data().to_float32_array(),
+                control_map.get_region(local).get_data().to_int32_array(), part.size.y]
+    return maps
+
+
+## The map of the vertex [param x], [param z] (global, in vertices) and the vertex's index in it; []
+## where the job has none
+static func _map_vertex(job: Dictionary, maps: Dictionary, x: int, z: int) -> Array:
+    var region_size: int = job["region_size"]
+    var map: Array = maps.get(Vector2i(floori(float(x) / region_size), floori(float(z) / region_size)), [])
+    if map.is_empty():
+        return []
+    var at: Vector2i = Vector2i(x, z) - map[0]
+    if at.x < 0 or at.y < 0 or at.x >= map[1] or at.y >= map[4]:
+        return []
+    return [map, at.y * map[1] + at.x]
+
+
+## The control bits at the world's [param x], [param z] as Terrain3DData.get_control() reads them
+## (the vertex at or before the point); -1 where there is no region
+static func _map_control(job: Dictionary, maps: Dictionary, x: float, z: float) -> int:
+    var spacing: float = job["spacing"]
+    var vertex: Array = _map_vertex(job, maps, floori(x / spacing), floori(z / spacing))
+    return vertex[0][3][vertex[1]] & HASH_MASK if vertex else -1
+
+
+## The terrain's height at the world's [param x], [param z] as Terrain3DData.get_height() works it
+## out - between its four vertices; NaN where there is no region or a hole
+static func _map_height(job: Dictionary, maps: Dictionary, x: float, z: float) -> float:
+    var control: int = _map_control(job, maps, x, z)
+    if control < 0 or control & CONTROL_HOLE:
+        return NAN
+    var spacing: float = job["spacing"]
+    var cell: Vector2 = Vector2(x, z) / spacing
+    var first: Vector2i = Vector2i(floori(cell.x), floori(cell.y))
+    var corners: PackedFloat32Array = PackedFloat32Array()
+    for offset: Vector2i in [Vector2i(0, 0), Vector2i(1, 0), Vector2i(0, 1), Vector2i(1, 1)]:
+        var vertex: Array = _map_vertex(job, maps, first.x + offset.x, first.y + offset.y)
+        if not vertex:
+            return NAN
+        corners.append(vertex[0][2][vertex[1]])
+    var weight: Vector2 = cell - Vector2(first)
+    return lerpf(lerpf(corners[0], corners[1], weight.x), lerpf(corners[2], corners[3], weight.x), weight.y)
+
+
+## The terrain's texture at the world's [param x], [param z] as the biome reads it - as
+## _terrain_texture_at() does on the terrain itself (the normal as Terrain3DData.get_normal())
+static func _map_texture(job: Dictionary, maps: Dictionary, config: Dictionary, x: float, z: float) -> int:
+    var control: int = _map_control(job, maps, x, z)
+    var base: int = control >> CONTROL_BASE_SHIFT & CONTROL_ID_MASK
+    var overlay: int = control >> CONTROL_OVERLAY_SHIFT & CONTROL_ID_MASK
+    var blend: float = float(control >> CONTROL_BLEND_SHIFT & CONTROL_BLEND_MASK) / CONTROL_BLEND_MASK
+    if control & CONTROL_AUTO:
+        if config["terrain_autoshader"] == TerrainAutoshader.NOTHING:
+            return TERRAIN_TEXTURE_ANYWHERE
+        if config["terrain_autoshader"] == TerrainAutoshader.AUTOSHADER_TEXTURE and job["auto_shader"]:
+            base = job["auto_base_texture"]
+            overlay = job["auto_overlay_texture"]
+            var spacing: float = job["spacing"]
+            var height: float = _map_height(job, maps, x, z)
+            var normal: Vector3 = Vector3(height - _map_height(job, maps, x + spacing, z), spacing,
+                    height - _map_height(job, maps, x, z + spacing)).normalized()
+            # Terrain3D's shader: lightweight.gdshader:258
+            blend = clampf(job["auto_slope"] * 2.0 * (normal.y - 1.0) + 1.0
+                    - job["auto_height_reduction"] * 0.01 * height, 0.0, 1.0)
+    return overlay if config["terrain_overlay"] and blend >= OVERLAY_BLEND_SHOWN else base
 
 
 ## On the main thread: the chunk's points stood on the terrain (where it grows on the biome's
@@ -594,42 +889,53 @@ func _build_chunk(scatter: Scatter, coords: Vector2i, points: Array) -> void:
 func _add_multimeshes(scatter: Scatter, chunk: Dictionary, chunk_transform: Transform3D, parts: Array,
         transforms: Array[Transform3D], center: Vector3, range_begin: float, range_end: float) -> void:
     for part: Dictionary in parts:
-        var mesh: Mesh = part["mesh"]
-        if not mesh:
-            continue
-        var part_transform: Transform3D = part["transform"]
-        var buffer: PackedFloat32Array = PackedFloat32Array()
-        buffer.resize(transforms.size() * TRANSFORM_FLOATS)
-        for index: int in transforms.size():
-            var t: Transform3D = transforms[index] * part_transform
-            t.origin -= center
-            var offset: int = index * TRANSFORM_FLOATS
-            # RenderingServer's MultiMesh buffer: the 3x4 matrix by rows
-            buffer[offset] = t.basis.x.x
-            buffer[offset + 1] = t.basis.y.x
-            buffer[offset + 2] = t.basis.z.x
-            buffer[offset + 3] = t.origin.x
-            buffer[offset + 4] = t.basis.x.y
-            buffer[offset + 5] = t.basis.y.y
-            buffer[offset + 6] = t.basis.z.y
-            buffer[offset + 7] = t.origin.y
-            buffer[offset + 8] = t.basis.x.z
-            buffer[offset + 9] = t.basis.y.z
-            buffer[offset + 10] = t.basis.z.z
-            buffer[offset + 11] = t.origin.z
-        var multimesh: RID = RenderingServer.multimesh_create()
-        RenderingServer.multimesh_set_mesh(multimesh, mesh.get_rid())
-        RenderingServer.multimesh_allocate_data(multimesh, transforms.size(), RenderingServer.MULTIMESH_TRANSFORM_3D)
-        RenderingServer.multimesh_set_buffer(multimesh, buffer)
-        var instance: RID = RenderingServer.instance_create2(multimesh, scatter.scenario)
-        RenderingServer.instance_set_transform(instance, chunk_transform)
-        RenderingServer.instance_geometry_set_cast_shadows_setting(instance, _shadows(scatter))
-        if range_begin > 0.0 or range_end > 0.0:
-            RenderingServer.instance_geometry_set_visibility_range(instance, range_begin, range_end, 0.0, 0.0,
-                    RenderingServer.VISIBILITY_RANGE_FADE_DISABLED)
-        chunk["multimeshes"].append(multimesh)
-        chunk["instances"].append(instance)
-        chunk["lods"].append(transforms.size())
+        if part["mesh"]:
+            _add_multimesh(scatter, chunk, chunk_transform, part["mesh"], _part_buffer(transforms, part["transform"], center),
+                    transforms.size(), range_begin, range_end)
+
+
+## The MultiMesh buffer of the part [param part_transform] of the models at [param transforms],
+## relative to the chunk's centre
+static func _part_buffer(transforms: Array[Transform3D], part_transform: Transform3D, center: Vector3) -> PackedFloat32Array:
+    var buffer: PackedFloat32Array = PackedFloat32Array()
+    buffer.resize(transforms.size() * TRANSFORM_FLOATS)
+    for index: int in transforms.size():
+        var t: Transform3D = transforms[index] * part_transform
+        t.origin -= center
+        var offset: int = index * TRANSFORM_FLOATS
+        # RenderingServer's MultiMesh buffer: the 3x4 matrix by rows
+        buffer[offset] = t.basis.x.x
+        buffer[offset + 1] = t.basis.y.x
+        buffer[offset + 2] = t.basis.z.x
+        buffer[offset + 3] = t.origin.x
+        buffer[offset + 4] = t.basis.x.y
+        buffer[offset + 5] = t.basis.y.y
+        buffer[offset + 6] = t.basis.z.y
+        buffer[offset + 7] = t.origin.y
+        buffer[offset + 8] = t.basis.x.z
+        buffer[offset + 9] = t.basis.y.z
+        buffer[offset + 10] = t.basis.z.z
+        buffer[offset + 11] = t.origin.z
+    return buffer
+
+
+## A MultiMesh of [param mesh] with [param buffer] ([param count] instances) and its instance in the
+## chunk, drawn from [param range_begin] to [param range_end] (0: no limit)
+func _add_multimesh(scatter: Scatter, chunk: Dictionary, chunk_transform: Transform3D, mesh: Mesh,
+        buffer: PackedFloat32Array, count: int, range_begin: float, range_end: float) -> void:
+    var multimesh: RID = RenderingServer.multimesh_create()
+    RenderingServer.multimesh_set_mesh(multimesh, mesh.get_rid())
+    RenderingServer.multimesh_allocate_data(multimesh, count, RenderingServer.MULTIMESH_TRANSFORM_3D)
+    RenderingServer.multimesh_set_buffer(multimesh, buffer)
+    var instance: RID = RenderingServer.instance_create2(multimesh, scatter.scenario)
+    RenderingServer.instance_set_transform(instance, chunk_transform)
+    RenderingServer.instance_geometry_set_cast_shadows_setting(instance, _shadows(scatter))
+    if range_begin > 0.0 or range_end > 0.0:
+        RenderingServer.instance_geometry_set_visibility_range(instance, range_begin, range_end, 0.0, 0.0,
+                RenderingServer.VISIBILITY_RANGE_FADE_DISABLED)
+    chunk["multimeshes"].append(multimesh)
+    chunk["instances"].append(instance)
+    chunk["lods"].append(count)
 
 
 func _shadows(scatter: Scatter) -> RenderingServer.ShadowCastingSetting:
