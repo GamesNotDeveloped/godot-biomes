@@ -4,18 +4,22 @@ class_name BiomesFarGround
 ## The far look of a texture of a Terrain3D (terrain3d_far.gdshader): a layer of plants makes the
 ## ground it grows on look like the plants past where it draws them - a field like its grain, a forest
 ## like its trees. Each layer writes only the entries of its own texture, so the layers keep theirs.
+## A Terrain3D shader of a game's own with the far look (terrain3d_far.gdshaderinc included) is kept:
+## a terrain needing more of its shader than the far look - the game's weather - keeps it.
 
 const SHADER: Shader = preload("./terrain3d_far.gdshader")
 const TEXTURES: int = 32
 ## The shader's far_albedo_1 .. far_albedo_4
 const ALBEDO_SLOTS: int = 4
+## The uniform a shader with the far look declares (terrain3d_far.gdshaderinc)
+const FAR_RANGE: StringName = &"far_range"
 
 
 ## Turns the texture [param texture_id] of the terrain's [param material] into [param albedo] - itself
 ## without one - toned by [param tint], from [param start] to [param end] metres from the camera
 static func apply(material: Terrain3DMaterial, texture_id: int, albedo: Texture2D, tint: Color,
         start: float, end: float) -> void:
-    if not material.shader_override == SHADER:
+    if not has_far_look(material):
         material.shader_override = SHADER
     material.shader_override_enabled = true
     _refresh_params(material)
@@ -29,11 +33,19 @@ static func apply(material: Terrain3DMaterial, texture_id: int, albedo: Texture2
 
 ## The texture [param texture_id] looks the same at any distance again
 static func clear(material: Terrain3DMaterial, texture_id: int) -> void:
-    if not material.shader_override == SHADER:
+    if not has_far_look(material):
         return
     _refresh_params(material)
     _set_entry(material, "far_range", PackedVector2Array(), texture_id, Vector2.ZERO)
     _set_entry(material, "far_albedo_slot", PackedInt32Array(), texture_id, 0)
+
+
+## The terrain's [param material] is drawn with a shader that has the far look: SHADER, or a game's
+## own including terrain3d_far.gdshaderinc
+static func has_far_look(material: Terrain3DMaterial) -> bool:
+    var shader: Shader = material.shader_override
+    return shader and shader.get_shader_uniform_list().any(
+            func(uniform: Dictionary) -> bool: return uniform["name"] == FAR_RANGE)
 
 
 ## Terrain3DMaterial takes only the parameters it has listed from its shader (its _active_params, made

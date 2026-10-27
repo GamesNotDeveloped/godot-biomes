@@ -2,10 +2,10 @@
 // (shader_override_enabled with no override, auto_shader off, dual_scaling on) - the Terrain3D maszyna-reloaded builds,
 // with its patches/terrain3d-region-window.patch: positions relative to the region map's window
 // (v_vertex, _camera_pos, _instance_origin) - with one addition: texture slots whose
-// look changes with the distance (far_*, far_look()) - a field turning into the grain growing on it
-// past where the grain is drawn, a forest's floor into its trees (far_ground.gd). After an update of
-// Terrain3D, or another setting of the material that changes the shader it generates, the copy is
-// made again the same way and far_look() put back.
+// look changes with the distance (far_*, far_look(), terrain3d_far.gdshaderinc) - a field turning
+// into the grain growing on it past where the grain is drawn, a forest's floor into its trees
+// (far_ground.gd). After an update of Terrain3D, or another setting of the material that changes the
+// shader it generates, the copy is made again the same way and the include and far_look() put back.
 shader_type spatial;
 render_mode blend_mix,depth_draw_opaque,cull_back,diffuse_burley,specular_schlick_ggx,skip_vertex_transform;
 
@@ -225,47 +225,7 @@ vec2 rotate_vec2(const vec2 v, const vec2 cs) {
 }
 
 // 2-4 lookups ( 2-6 with dual scaling )
-// the far look of each texture of the terrain (id 0-31): past far_range.x [m from
-// the camera] it turns into its far albedo (far_albedo_slot: far_albedo_1-4, 0 none: its own albedo)
-// toned by far_tint, completely at far_range.y; a texture whose far_range.y is 0 has none. far_tint
-// is linear (far_ground.gd converts it).
-// Each layer of plants writes the entries of its own texture (far_ground.gd).
-uniform vec2 far_range[32];
-uniform vec3 far_tint[32];
-uniform int far_albedo_slot[32];
-uniform sampler2D far_albedo_1 : source_color, hint_default_transparent, filter_linear_mipmap_anisotropic, repeat_enable;
-uniform sampler2D far_albedo_2 : source_color, hint_default_transparent, filter_linear_mipmap_anisotropic, repeat_enable;
-uniform sampler2D far_albedo_3 : source_color, hint_default_transparent, filter_linear_mipmap_anisotropic, repeat_enable;
-uniform sampler2D far_albedo_4 : source_color, hint_default_transparent, filter_linear_mipmap_anisotropic, repeat_enable;
-uniform float far_albedo_uv_scale = 0.1;
-
-vec3 far_look(const int id, const vec3 albedo, const vec3 base_ddx, const vec3 base_ddy) {
-	vec2 range = far_range[id];
-	if (range.y <= 0.0) {
-		return albedo;
-	}
-	// the distance the particle layers fade by (particles.gdshader: length(camera_position - pos)),
-	// not the horizontal one - from above the layer is gone while the ground below is near
-	float far = smoothstep(range.x, range.y, distance(v_vertex, _camera_pos));
-	if (far <= 0.0) {
-		return albedo;
-	}
-	vec2 far_uv = v_vertex.xz * far_albedo_uv_scale;
-	vec2 far_ddx = base_ddx.xz * far_albedo_uv_scale;
-	vec2 far_ddy = base_ddy.xz * far_albedo_uv_scale;
-	vec4 far_tex = vec4(albedo, 1.0);
-	int slot = far_albedo_slot[id];
-	if (slot == 1) {
-		far_tex = textureGrad(far_albedo_1, far_uv, far_ddx, far_ddy);
-	} else if (slot == 2) {
-		far_tex = textureGrad(far_albedo_2, far_uv, far_ddx, far_ddy);
-	} else if (slot == 3) {
-		far_tex = textureGrad(far_albedo_3, far_uv, far_ddx, far_ddy);
-	} else if (slot == 4) {
-		far_tex = textureGrad(far_albedo_4, far_uv, far_ddx, far_ddy);
-	}
-	return mix(albedo, mix(albedo, far_tex.rgb, far_tex.a) * far_tint[id], far);
-}
+#include "terrain3d_far.gdshaderinc"
 
 void accumulate_material(const vec3 base_ddx, const vec3 base_ddy, const float weight, const ivec3 index,
 			const uint control, const vec2 texture_weight, const ivec2 texture_id, const vec3 i_normal,
