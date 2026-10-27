@@ -384,6 +384,7 @@ func scatter_free(rid: RID) -> void:
     _wait_for_tasks(scatter)
     for coords: Vector2i in scatter.chunks.keys():
         _drop_chunk(scatter, coords)
+    _far_free(scatter)
     var data: Object = instance_from_id(scatter.maps_data_id) if scatter.maps_data_id else null
     if data:
         data.maps_changed.disconnect(_on_terrain_maps_changed)
