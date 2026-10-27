@@ -434,7 +434,8 @@ func scatter_configure(rid: RID, config: Dictionary, mask: Image) -> void:
     _clear(scatter)
     scatter.config = config
     scatter.mask = mask
-    scatter.entries = _resolve_entries(config["entries"])
+    scatter.entries = _resolve_entries(config["entries"],
+            config["billboard_shader"] if config["billboard_shader"] else BILLBOARD_SHADER)
 
 
 ## The chunks under [param area] (global; the terrain painted there) grow again
@@ -716,20 +717,9 @@ static func _far_possible(scatter: Scatter, terrain: Node3D) -> bool:
             or scatter.entries.is_empty() or scatter.entries.size() > FAR_ENTRIES_MAX:
         return false
     for entry: Dictionary in scatter.entries:
-        if not _entry_billboard(entry):
+        if not entry["billboard"]:
             return false
     return true
-
-
-## An entry's billboard's material (billboard.gdshader's), null without one
-static func _entry_billboard(entry: Dictionary) -> ShaderMaterial:
-    for part: Dictionary in entry["billboard_parts"]:
-        var mesh: Mesh = part["mesh"]
-        for surface: int in mesh.get_surface_count() if mesh else 0:
-            var material: ShaderMaterial = mesh.surface_get_material(surface) as ShaderMaterial
-            if material and material.shader == BILLBOARD_SHADER:
-                return material
-    return null
 
 
 ## How far a biome's models can be drawn: its farthest billboard_lod_distance
@@ -751,7 +741,7 @@ func _far_create(scatter: Scatter, distance: float) -> void:
     var process: ShaderMaterial = ShaderMaterial.new()
     process.shader = BILLBOARDS_SHADER
     var draw: ShaderMaterial = ShaderMaterial.new()
-    draw.shader = BILLBOARD_PARTICLES_SHADER
+    draw.shader = config["far_billboard_shader"] if config["far_billboard_shader"] else BILLBOARD_PARTICLES_SHADER
     var quad: QuadMesh = QuadMesh.new()
     quad.material = draw
     var cumulative: PackedFloat32Array = PackedFloat32Array()
@@ -766,7 +756,7 @@ func _far_create(scatter: Scatter, distance: float) -> void:
     # the shaders' arrays all FAR_ENTRIES_MAX long, the last entry repeated past the entries
     for index: int in FAR_ENTRIES_MAX:
         var entry: Dictionary = scatter.entries[mini(index, scatter.entries.size() - 1)]
-        var billboard: ShaderMaterial = _entry_billboard(entry)
+        var billboard: ShaderMaterial = entry["billboard"]
         var part: Dictionary = entry["billboard_parts"][0]
         var size: Vector3 = (part["mesh"] as Mesh).get_aabb().size
         if index < scatter.entries.size():
@@ -1341,46 +1331,53 @@ static func _hash01(a: int, b: int, c: int, salt: int) -> float:
 ## The entries made drawable: their models' mesh parts (with the materials of their instances), their
 ## mid models' and shadow meshes', and billboard parts (billboard.gdshader), the billboards' materials
 ## kept on the entry for its brightness
-func _resolve_entries(entries: Array) -> Array[Dictionary]:
+## The entries made drawable, their billboards drawn with [param billboard_shader]
+func _resolve_entries(entries: Array, billboard_shader: Shader) -> Array[Dictionary]:
     var resolved: Array[Dictionary] = []
     var billboard_cache: Dictionary = {}
     for index: int in entries.size():
         var entry: BiomeScatterEntry = entries[index]
         if not entry:
             continue
-        var main_parts: Array[Dictionary] = _mesh_parts(entry.mesh_scene, entry.mesh, false, billboard_cache)
+        var main_parts: Array[Dictionary] = _mesh_parts(entry.mesh_scene, entry.mesh, null, billboard_cache)
         if main_parts.is_empty() or entry.probability <= 0.0:
             continue
-        var billboard_parts: Array[Dictionary] = _mesh_parts(entry.billboard_scene, entry.billboard_mesh, true, billboard_cache)
-        var shadow_parts: Array[Dictionary] = _mesh_parts(entry.shadow_scene, null, false, billboard_cache)
-        var mid_parts: Array[Dictionary] = _mesh_parts(entry.mid_scene, null, false, billboard_cache)
+        var billboard_parts: Array[Dictionary] = _mesh_parts(entry.billboard_scene, entry.billboard_mesh, billboard_shader, billboard_cache)
+        var shadow_parts: Array[Dictionary] = _mesh_parts(entry.shadow_scene, null, null, billboard_cache)
+        var mid_parts: Array[Dictionary] = _mesh_parts(entry.mid_scene, null, null, billboard_cache)
         entry.billboard_materials.clear()
         for part: Dictionary in billboard_parts:
             var part_mesh: Mesh = part["mesh"]
             for surface: int in part_mesh.get_surface_count():
                 var material: ShaderMaterial = part_mesh.surface_get_material(surface) as ShaderMaterial
-                if material and material.shader == BILLBOARD_SHADER:
+                if material and material.shader == billboard_shader:
                     material.set_shader_parameter("brightness", entry.billboard_brightness)
                     entry.billboard_materials.append(material)
-        resolved.append({"index": index, "main_parts": main_parts, "billboard_parts": billboard_parts, "shadow_parts": shadow_parts,
+        # its billboard's material (the GPU draws the far ones with its texture), null without one
+        var billboard: ShaderMaterial = entry.billboard_materials[0] if entry.billboard_materials else null
+        resolved.append({"index": index, "main_parts": main_parts, "billboard_parts": billboard_parts, "billboard": billboard,
+                "shadow_parts": shadow_parts,
                 "mid_parts": mid_parts, "mid_lod_distance": maxf(entry.mid_lod_distance, 0.0),
                 "probability": entry.probability, "billboard_lod_distance": maxf(entry.billboard_lod_distance, 0.0),
                 "scale_min": entry.scale_min, "scale_max": entry.scale_max})
     return resolved
 
 
-func _mesh_parts(scene: PackedScene, fallback: Mesh, billboard: bool, cache: Dictionary) -> Array[Dictionary]:
+## The meshes of [param scene] (else [param fallback]), drawn as billboards with [param billboard_shader]
+## when one is given
+func _mesh_parts(scene: PackedScene, fallback: Mesh, billboard_shader: Shader, cache: Dictionary) -> Array[Dictionary]:
     var parts: Array[Dictionary] = []
     var instance: Node = scene.instantiate() if scene else null
     if instance:
-        _collect_mesh_parts(instance, Transform3D.IDENTITY, billboard, parts, cache)
+        _collect_mesh_parts(instance, Transform3D.IDENTITY, billboard_shader, parts, cache)
         instance.free()
     if parts.is_empty() and fallback:
-        parts.append({"mesh": _billboard_mesh(fallback, cache) if billboard else fallback, "transform": Transform3D.IDENTITY})
+        parts.append({"mesh": _billboard_mesh(fallback, billboard_shader, cache) if billboard_shader else fallback,
+                "transform": Transform3D.IDENTITY})
     return parts
 
 
-func _collect_mesh_parts(node: Node, parent: Transform3D, billboard: bool, parts: Array[Dictionary], cache: Dictionary) -> void:
+func _collect_mesh_parts(node: Node, parent: Transform3D, billboard_shader: Shader, parts: Array[Dictionary], cache: Dictionary) -> void:
     var local: Transform3D = parent * (node as Node3D).transform if node is Node3D else parent
     var mesh_instance: MeshInstance3D = node as MeshInstance3D
     if mesh_instance and mesh_instance.mesh:
@@ -1388,30 +1385,32 @@ func _collect_mesh_parts(node: Node, parent: Transform3D, billboard: bool, parts
         for surface: int in mesh.get_surface_count():
             var material: Material = mesh_instance.get_active_material(surface)
             if material:
-                mesh.surface_set_material(surface, _billboard_material(material) if billboard and material is BaseMaterial3D else material)
-        parts.append({"mesh": _billboard_mesh(mesh, cache) if billboard else mesh, "transform": local})
+                mesh.surface_set_material(surface,
+                        _billboard_material(material, billboard_shader) if billboard_shader and material is BaseMaterial3D else material)
+        parts.append({"mesh": _billboard_mesh(mesh, billboard_shader, cache) if billboard_shader else mesh, "transform": local})
     for child: Node in node.get_children():
-        _collect_mesh_parts(child, local, billboard, parts, cache)
+        _collect_mesh_parts(child, local, billboard_shader, parts, cache)
 
 
-func _billboard_mesh(source: Mesh, cache: Dictionary) -> Mesh:
+func _billboard_mesh(source: Mesh, billboard_shader: Shader, cache: Dictionary) -> Mesh:
     if cache.has(source.get_instance_id()):
         return cache[source.get_instance_id()]
     var mesh: Mesh = source.duplicate(true) as Mesh
     for surface: int in mesh.get_surface_count():
         var material: Material = mesh.surface_get_material(surface)
         if not material or material is BaseMaterial3D:
-            mesh.surface_set_material(surface, _billboard_material(material))
+            mesh.surface_set_material(surface, _billboard_material(material, billboard_shader))
     cache[source.get_instance_id()] = mesh
     return mesh
 
 
-## The far LOD's material: billboard.gdshader with [param source]'s texture and colour (a
-## BaseMaterial3D from the billboard generator; null gives a white one). BaseMaterial3D's own
-## BILLBOARD_FIXED_Y lit the quad by a normal following the camera (see the shader).
-static func _billboard_material(source: Material) -> ShaderMaterial:
+## The far LOD's material: [param billboard_shader] (billboard.gdshader, or a game's own including
+## billboard.gdshaderinc) with [param source]'s texture and colour (a BaseMaterial3D from the
+## billboard generator; null gives a white one). BaseMaterial3D's own BILLBOARD_FIXED_Y lit the quad
+## by a normal following the camera (see the shader).
+static func _billboard_material(source: Material, billboard_shader: Shader) -> ShaderMaterial:
     var material: ShaderMaterial = ShaderMaterial.new()
-    material.shader = BILLBOARD_SHADER
+    material.shader = billboard_shader
     var base: BaseMaterial3D = source as BaseMaterial3D
     if base:
         material.resource_name = base.resource_name

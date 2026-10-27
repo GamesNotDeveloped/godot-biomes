@@ -160,6 +160,21 @@ var _terrain_edit_timer: Timer
 
 @export_subgroup("")
 
+@export_group("Billboards")
+## the shader the entries' billboards are drawn with by the CPU - billboard.gdshader without one; a
+## game's own includes billboard.gdshaderinc (its weather on them, BILLBOARD_WEATHER)
+@export var billboard_shader: Shader:
+    set(value):
+        billboard_shader = value
+        _queue_configure()
+
+## the shader the far trees' billboards are drawn with by the GPU - billboard_particles.gdshader
+## without one; a game's own includes billboard_particles.gdshaderinc
+@export var far_billboard_shader: Shader:
+    set(value):
+        far_billboard_shader = value
+        _queue_configure()
+
 @export_group("Far Ground")
 ## the ground the layer grows on (terrain_texture) drawn far away as Far Texture -
 ## its own texture without one - toned by Far Tint, fading in from Far Start to Far End [m from the camera],
@@ -307,6 +322,8 @@ func _notification(what: int) -> void:
 func get_config() -> Dictionary:
     return {
         "entries": entries.duplicate(),
+        "billboard_shader": billboard_shader,
+        "far_billboard_shader": far_billboard_shader,
         "streaming_enabled": streaming_enabled,
         "max_generation_distance": max_generation_distance,
         "follow_draw_distance": follow_draw_distance,
