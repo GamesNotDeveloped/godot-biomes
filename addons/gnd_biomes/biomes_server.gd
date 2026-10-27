@@ -7,7 +7,11 @@ extends Node
 ##   its points, on a terrain stood on it and their MultiMeshes' buffers too, from the maps of its
 ##   regions taken for the task (_terrain_job()) - and drawn as MultiMeshes (a near one and a
 ##   billboard one per model part) on the main thread; the chunks are planned on a timer
-##   (STREAM_INTERVAL), never per frame. Where a forest's
+##   (STREAM_INTERVAL), never per frame. On a terrain, its entries all with billboards, the
+##   billboards are drawn by the GPU instead (_far_create(): particles placing the trees as the CPU
+##   does), and the CPU grows only the chunks whose models are drawn: what is drawn where is decided
+##   by a chunk's middle's distance from the camera on both (_apply_visibility(),
+##   billboard_particles.gdshader). Where a forest's
 ##   trees end its canopy baked with the world (BiomesFarCanopy) shows: its layer's distance is
 ##   CANOPY_BEGIN_PARAMETER;
 ## - grass (BiomesGrass: blades - grass, grain - on textures of its terrain; grass_create(),
@@ -15,6 +19,16 @@ extends Node
 ##   maps, moved after the camera - the one thing looked at every frame, while there is grass.
 
 const BILLBOARD_SHADER: Shader = preload("./billboard.gdshader")
+## A layer's billboards on the GPU (the far trees): placed by the particles' process shader, drawn by
+## the draw pass's
+const BILLBOARDS_SHADER: Shader = preload("./billboards.gdshader")
+const BILLBOARD_PARTICLES_SHADER: Shader = preload("./billboard_particles.gdshader")
+## The far trees' entries at most (the shaders' ENTRIES_MAX)
+const FAR_ENTRIES_MAX: int = 8
+## The far trees' grid moves after the camera by this [m], restarted then
+const FAR_ANCHOR_STEP: float = 64.0
+## The far trees' bounds over the terrain's highest point, for the tallest tree [m]
+const FAR_TREE_HEIGHT_MAX: float = 60.0
 ## How often the camera is looked at and the chunks planned [s]
 const STREAM_INTERVAL: float = 0.1
 ## terrain_texture of a biome growing on any texture
@@ -107,6 +121,11 @@ class Scatter:
     ## Raised whenever the terrain's maps change (regions streamed in): a chunk grown on the maps of
     ## before where a region was missing is let go of and grows again
     var terrain_stamp: int = 0
+    ## The billboards drawn on the GPU (_far_create()): particles, instance, process, draw (materials),
+    ## quad, spacing, reach, distance, anchor (cell); empty while the CPU draws them
+    var far: Dictionary = {}
+    ## Where the camera was when what is drawn where was decided last (_apply_visibility())
+    var view: Vector3 = Vector3.INF
     ## The chunks around the camera's chunk to grow: their offsets from it, nearest first - planned
     ## when the distance or the chunk's size changes (plan: [distance, size]), the same wherever the
     ## camera is - the camera's chunk, and the next offset to look at
@@ -220,6 +239,9 @@ func _on_terrain_maps_changed() -> void:
             _set_process_parameters(grass, grass.last_position.snapped(Vector3.ONE))
     for scatter: Scatter in _scatters.values():
         scatter.terrain_stamp += 1
+        # the far trees stand on the maps there are now
+        if scatter.far:
+            scatter.far["anchor"] = Vector2i.MAX
         for coords: Vector2i in scatter.chunks.keys():
             if scatter.chunks[coords]["missing"]:
                 _drop_chunk(scatter, coords)
@@ -318,17 +340,9 @@ func _set_process_parameters(grass: Grass, camera_position: Vector3) -> void:
     var config: Dictionary = grass.config
     var process: RID = config["process_material"].get_rid()
     RenderingServer.material_set_param(process, "camera_position", camera_position)
-    RenderingServer.material_set_param(process, "_background_mode", terrain.material.world_background)
-    RenderingServer.material_set_param(process, "_vertex_spacing", terrain.vertex_spacing)
-    RenderingServer.material_set_param(process, "_vertex_density", 1.0 / terrain.vertex_spacing)
-    RenderingServer.material_set_param(process, "_region_size", terrain.region_size)
+    _set_terrain_maps(process, terrain)
     RenderingServer.material_set_param(process, "_region_texel_size", 1.0 / terrain.region_size)
-    RenderingServer.material_set_param(process, "_region_map_size", REGION_MAP_SIZE)
-    RenderingServer.material_set_param(process, "_region_map", terrain.data.get_region_map())
-    RenderingServer.material_set_param(process, "_region_map_origin", terrain.data.get_region_map_origin())
     RenderingServer.material_set_param(process, "_region_locations", terrain.data.get_region_locations())
-    RenderingServer.material_set_param(process, "_height_maps", terrain.data.get_height_maps_rid())
-    RenderingServer.material_set_param(process, "_control_maps", terrain.data.get_control_maps_rid())
     RenderingServer.material_set_param(process, "_color_maps", terrain.data.get_color_maps_rid())
     RenderingServer.material_set_param(process, "instance_spacing", config["instance_spacing"])
     RenderingServer.material_set_param(process, "instance_rows", config["rows"])
@@ -337,6 +351,20 @@ func _set_process_parameters(grass: Grass, camera_position: Vector3) -> void:
     RenderingServer.material_set_param(process, "allowed_ids", config["terrain_textures"])
     RenderingServer.material_set_param(process, "autoshader_mode", config["terrain_autoshader"])
     RenderingServer.material_set_param(process, "use_overlay", config["terrain_overlay"])
+
+
+## A particles' process material told [param terrain]'s maps and how its material shows them (the
+## grass's and the far trees' shaders read them alike)
+static func _set_terrain_maps(process: RID, terrain: Node3D) -> void:
+    RenderingServer.material_set_param(process, "_background_mode", terrain.material.world_background)
+    RenderingServer.material_set_param(process, "_vertex_spacing", terrain.vertex_spacing)
+    RenderingServer.material_set_param(process, "_vertex_density", 1.0 / terrain.vertex_spacing)
+    RenderingServer.material_set_param(process, "_region_size", terrain.region_size)
+    RenderingServer.material_set_param(process, "_region_map_size", REGION_MAP_SIZE)
+    RenderingServer.material_set_param(process, "_region_map", terrain.data.get_region_map())
+    RenderingServer.material_set_param(process, "_region_map_origin", terrain.data.get_region_map_origin())
+    RenderingServer.material_set_param(process, "_height_maps", terrain.data.get_height_maps_rid())
+    RenderingServer.material_set_param(process, "_control_maps", terrain.data.get_control_maps_rid())
     RenderingServer.material_set_param(process, "_auto_shader", terrain.material.get_auto_shader())
     for parameter: Array in [["auto_slope", AUTO_SLOPE_DEFAULT], ["auto_height_reduction", AUTO_HEIGHT_REDUCTION_DEFAULT],
             ["auto_base_texture", AUTO_BASE_TEXTURE_DEFAULT], ["auto_overlay_texture", AUTO_OVERLAY_TEXTURE_DEFAULT]]:
@@ -370,6 +398,8 @@ func scatter_set_scenario(rid: RID, scenario: RID, space: RID) -> void:
     for chunk: Dictionary in scatter.chunks.values():
         for instance: RID in chunk["instances"]:
             RenderingServer.instance_set_scenario(instance, scenario)
+    if scatter.far:
+        RenderingServer.instance_set_scenario(scatter.far["instance"], scenario)
 
 
 ## Where the biome's area is centred: its node's global transform
@@ -436,6 +466,7 @@ func _clear(scatter: Scatter) -> void:
     for coords: Vector2i in scatter.chunks.keys():
         _drop_chunk(scatter, coords)
     scatter.plan = []
+    _far_free(scatter)
 
 
 func _wait_for_tasks(scatter: Scatter) -> void:
@@ -502,6 +533,17 @@ func _stream_scatter(scatter: Scatter, camera_position: Vector3) -> void:
     var camera_local: Vector3 = scatter.transform.affine_inverse() * camera_position
     var camera_chunk: Vector2i = Vector2i(floori(camera_local.x / size), floori(camera_local.z / size))
     var distance: float = _generation_distance(config)
+    var terrain: Node3D = instance_from_id(scatter.terrain_id) as Node3D if scatter.terrain_id else null
+    # the far trees on the GPU when they can be, made again as their distance changes
+    var far_possible: bool = _far_possible(scatter, terrain)
+    if not far_possible == not scatter.far.is_empty() or (scatter.far and not scatter.far["distance"] == distance):
+        _clear(scatter)
+        if far_possible:
+            _far_create(scatter, distance)
+    # with them the CPU grows the chunks whose models can be drawn: within the farthest billboard
+    # distance of the camera, give or take half a chunk's diagonal
+    if scatter.far:
+        distance = minf(distance, _models_reach(scatter) + size * sqrt(2.0) * 0.5)
     if not scatter.plan == [distance, size]:
         _plan_chunks(scatter, distance, size)
     if not scatter.center == camera_chunk:
@@ -513,6 +555,11 @@ func _stream_scatter(scatter: Scatter, camera_position: Vector3) -> void:
     _hand_out_chunks(scatter)
     if config["density_lod_enabled"]:
         _apply_density(scatter, camera_local)
+    if scatter.far:
+        scatter.view = camera_position
+        for chunk: Dictionary in scatter.chunks.values():
+            _apply_visibility(scatter, chunk)
+        _far_follow(scatter, terrain, camera_local)
 
 
 ## The next chunks to grow handed to the worker threads, nearest first, up to CHUNK_TASKS at once
@@ -625,9 +672,7 @@ static func _chunk_points(scatter: Scatter, coords: Vector2i) -> Array:
     var chunk_min: Vector2 = Vector2(coords) * size
     var chunk_max: Vector2 = chunk_min + Vector2(size, size)
     var half_area: Vector2 = area_size * 0.5
-    var spacing: float = maxf(config["average_spacing"], 0.1)
-    if config["max_instances"] > 0:
-        spacing = maxf(spacing, sqrt(maxf(area_size.x * area_size.y, 0.0001) / float(config["max_instances"])))
+    var spacing: float = _spacing(config)
     var points: Array = []
     for cell_x in range(floori(chunk_min.x / spacing), ceili(chunk_max.x / spacing)):
         for cell_z in range(floori(chunk_min.y / spacing), ceili(chunk_max.y / spacing)):
@@ -655,6 +700,153 @@ static func _chunk_points(scatter: Scatter, coords: Vector2i) -> Array:
     return points
 
 
+## The cells' spacing of a biome's points: its average_spacing, larger where max_instances caps them
+static func _spacing(config: Dictionary) -> float:
+    var area_size: Vector2 = config["area_size"]
+    var spacing: float = maxf(config["average_spacing"], 0.1)
+    if config["max_instances"] > 0:
+        spacing = maxf(spacing, sqrt(maxf(area_size.x * area_size.y, 0.0001) / float(config["max_instances"])))
+    return spacing
+
+
+## Whether a biome's billboards can be drawn on the GPU: on a terrain, the biome not turned, at most
+## FAR_ENTRIES_MAX entries, each with a billboard of billboard.gdshader
+static func _far_possible(scatter: Scatter, terrain: Node3D) -> bool:
+    if not terrain or not terrain.data or not scatter.transform.basis.is_equal_approx(Basis.IDENTITY) \
+            or scatter.entries.is_empty() or scatter.entries.size() > FAR_ENTRIES_MAX:
+        return false
+    for entry: Dictionary in scatter.entries:
+        if not _entry_billboard(entry):
+            return false
+    return true
+
+
+## An entry's billboard's material (billboard.gdshader's), null without one
+static func _entry_billboard(entry: Dictionary) -> ShaderMaterial:
+    for part: Dictionary in entry["billboard_parts"]:
+        var mesh: Mesh = part["mesh"]
+        for surface: int in mesh.get_surface_count() if mesh else 0:
+            var material: ShaderMaterial = mesh.surface_get_material(surface) as ShaderMaterial
+            if material and material.shader == BILLBOARD_SHADER:
+                return material
+    return null
+
+
+## How far a biome's models can be drawn: its farthest billboard_lod_distance
+static func _models_reach(scatter: Scatter) -> float:
+    var reach: float = 0.0
+    for entry: Dictionary in scatter.entries:
+        reach = maxf(reach, entry["billboard_lod_distance"])
+    return reach
+
+
+## The biome's billboards on the GPU within [param distance]: a particle a cell of the biome's spacing
+## around the camera's anchor cell (billboards.gdshader places them as _chunk_points() and
+## _grow_chunk() do), drawn as the entries' billboards (billboard_particles.gdshader)
+func _far_create(scatter: Scatter, distance: float) -> void:
+    var config: Dictionary = scatter.config
+    var spacing: float = _spacing(config)
+    var reach: float = distance + FAR_ANCHOR_STEP
+    var rows: int = 2 * ceili(reach / spacing) + 1
+    var process: ShaderMaterial = ShaderMaterial.new()
+    process.shader = BILLBOARDS_SHADER
+    var draw: ShaderMaterial = ShaderMaterial.new()
+    draw.shader = BILLBOARD_PARTICLES_SHADER
+    var quad: QuadMesh = QuadMesh.new()
+    quad.material = draw
+    var cumulative: PackedFloat32Array = PackedFloat32Array()
+    var scale_low: PackedVector3Array = PackedVector3Array()
+    var scale_high: PackedVector3Array = PackedVector3Array()
+    var quad_size: PackedVector2Array = PackedVector2Array()
+    var quad_lift: PackedFloat32Array = PackedFloat32Array()
+    var colors: PackedColorArray = PackedColorArray()
+    var brightness: PackedFloat32Array = PackedFloat32Array()
+    var lods: PackedFloat32Array = PackedFloat32Array()
+    var total: float = 0.0
+    # the shaders' arrays all FAR_ENTRIES_MAX long, the last entry repeated past the entries
+    for index: int in FAR_ENTRIES_MAX:
+        var entry: Dictionary = scatter.entries[mini(index, scatter.entries.size() - 1)]
+        var billboard: ShaderMaterial = _entry_billboard(entry)
+        var part: Dictionary = entry["billboard_parts"][0]
+        var size: Vector3 = (part["mesh"] as Mesh).get_aabb().size
+        if index < scatter.entries.size():
+            total += float(entry["probability"])
+            draw.set_shader_parameter("albedo_%d" % index, billboard.get_shader_parameter("albedo_texture"))
+        cumulative.append(total)
+        scale_low.append(entry["scale_min"])
+        scale_high.append(entry["scale_max"])
+        quad_size.append(Vector2(size.x, size.y))
+        quad_lift.append((part["transform"] as Transform3D).origin.y)
+        # the array takes no source_color hint
+        var color: Variant = billboard.get_shader_parameter("albedo_color")
+        colors.append((color as Color).srgb_to_linear() if color is Color else Color.WHITE)
+        var light: Variant = billboard.get_shader_parameter("brightness")
+        brightness.append(float(light) if light != null else 1.0)
+        lods.append(entry["billboard_lod_distance"])
+    var origin: Vector2 = Vector2(scatter.transform.origin.x, scatter.transform.origin.z)
+    var masked: bool = config["mask_enabled"] and scatter.mask != null
+    for parameter: Array in [["seed", config["seed"]], ["spacing", spacing], ["half_area", config["area_size"] * 0.5],
+            ["origin", origin], ["entry_count", scatter.entries.size()], ["cumulative", cumulative], ["scale_low", scale_low],
+            ["scale_high", scale_high], ["quad_size", quad_size], ["quad_lift", quad_lift], ["rows", rows], ["reach", reach],
+            ["terrain_texture", config["terrain_texture"]], ["autoshader_mode", config["terrain_autoshader"]],
+            ["use_overlay", config["terrain_overlay"]], ["mask_enabled", masked], ["mask_channel", config["mask_channel"]],
+            ["mask_threshold", config["mask_threshold"]], ["mask_inverse", config["mask_inverse"]],
+            ["mask_affects_density", config["mask_affects_density"]]]:
+        process.set_shader_parameter(parameter[0], parameter[1])
+    if masked:
+        process.set_shader_parameter("mask_texture", ImageTexture.create_from_image(scatter.mask))
+    for parameter: Array in [["albedo_color", colors], ["brightness", brightness], ["lod_distance", lods],
+            ["chunk_origin", origin], ["chunk_size", config["chunk_size"]], ["max_distance", distance]]:
+        draw.set_shader_parameter(parameter[0], parameter[1])
+    var particles: RID = RenderingServer.particles_create()
+    RenderingServer.particles_set_mode(particles, RenderingServer.PARTICLES_MODE_3D)
+    RenderingServer.particles_set_amount(particles, rows * rows)
+    RenderingServer.particles_set_lifetime(particles, PARTICLES_LIFETIME)
+    RenderingServer.particles_set_explosiveness_ratio(particles, 1.0)
+    RenderingServer.particles_set_use_local_coordinates(particles, false)
+    RenderingServer.particles_set_process_material(particles, process.get_rid())
+    RenderingServer.particles_set_draw_passes(particles, 1)
+    RenderingServer.particles_set_draw_pass_mesh(particles, 0, quad.get_rid())
+    RenderingServer.particles_set_emitting(particles, true)
+    var instance: RID = RenderingServer.instance_create2(particles, scatter.scenario)
+    RenderingServer.instance_geometry_set_cast_shadows_setting(instance, _shadows(scatter))
+    scatter.far = {"particles": particles, "instance": instance, "process": process, "draw": draw, "quad": quad,
+            "spacing": spacing, "reach": reach, "distance": distance, "anchor": Vector2i.MAX}
+
+
+## The far trees after the camera: the draw pass told where it is (as the CPU decided what is drawn
+## where this tick), the grid restarted on the terrain's maps as its anchor cell - the camera's cell
+## snapped to FAR_ANCHOR_STEP - moves, or the maps changed (anchor reset)
+func _far_follow(scatter: Scatter, terrain: Node3D, camera_local: Vector3) -> void:
+    var far: Dictionary = scatter.far
+    RenderingServer.material_set_param(far["draw"].get_rid(), "view_position", scatter.view)
+    var spacing: float = far["spacing"]
+    var step: int = maxi(1, roundi(FAR_ANCHOR_STEP / spacing))
+    var anchor: Vector2i = Vector2i(floori(camera_local.x / spacing / step) * step, floori(camera_local.z / spacing / step) * step)
+    if anchor == far["anchor"]:
+        return
+    far["anchor"] = anchor
+    var process: RID = far["process"].get_rid()
+    _set_terrain_maps(process, terrain)
+    RenderingServer.material_set_param(process, "anchor", anchor)
+    var reach: float = far["reach"]
+    var middle: Vector3 = scatter.transform * Vector3((anchor.x + 0.5) * spacing, 0.0, (anchor.y + 0.5) * spacing)
+    var heights: Vector2 = terrain.data.get_height_range()
+    RenderingServer.particles_set_custom_aabb(far["particles"], AABB(Vector3(middle.x - reach, heights.x, middle.z - reach),
+            Vector3(reach * 2.0, heights.y - heights.x + FAR_TREE_HEIGHT_MAX, reach * 2.0)))
+    RenderingServer.particles_restart(far["particles"])
+
+
+## The far trees let go of
+func _far_free(scatter: Scatter) -> void:
+    if scatter.far.is_empty():
+        return
+    RenderingServer.free_rid(scatter.far["instance"])
+    RenderingServer.free_rid(scatter.far["particles"])
+    scatter.far = {}
+    scatter.view = Vector3.INF
+
+
 ## On the main thread: what a chunk grown on [param terrain] is worked out of on a worker thread
 ## (_grow_chunk()), all of it the task's own - the maps of the terrain's regions under the chunk (a
 ## region taken out of the terrain meanwhile keeps its maps for the task) and how the biome reads them
@@ -677,7 +869,7 @@ func _terrain_job(scatter: Scatter, terrain: Node3D, coords: Vector2i) -> Dictio
                 regions[Vector2i(x, z)] = [region.get_height_map(), region.get_control_map()]
     var job: Dictionary = {"spacing": spacing, "region_size": region_size, "regions": regions,
             "vertices": Rect2i(first, last - first + Vector2i.ONE), "terrain_stamp": scatter.terrain_stamp,
-            "auto_shader": terrain.material.get_auto_shader()}
+            "auto_shader": terrain.material.get_auto_shader(), "far": not scatter.far.is_empty()}
     for parameter: Array in [["auto_slope", AUTO_SLOPE_DEFAULT], ["auto_height_reduction", AUTO_HEIGHT_REDUCTION_DEFAULT],
             ["auto_base_texture", AUTO_BASE_TEXTURE_DEFAULT], ["auto_overlay_texture", AUTO_OVERLAY_TEXTURE_DEFAULT]]:
         job[parameter[0]] = _material_param(terrain, parameter[0], parameter[1])
@@ -729,7 +921,9 @@ func _grow_chunk(scatter: Scatter, coords: Vector2i, generation: int, job: Dicti
         var shadows: Array = entry["shadow_parts"]
         var model_shadow: PartShadow = PartShadow.NONE if shadows else PartShadow.CAST
         for group: Array in [[entry["main_parts"], 0.0, mid, model_shadow], [entry["mid_parts"], mid, near_end, model_shadow],
-                [shadows, 0.0, near_end, PartShadow.ONLY], [entry["billboard_parts"], lod if lod > 0.0 else 0.0, 0.0, PartShadow.CAST]]:
+                [shadows, 0.0, near_end, PartShadow.ONLY],
+                # the billboards on the GPU with the far trees
+                [[] if job["far"] else entry["billboard_parts"], lod if lod > 0.0 else 0.0, 0.0, PartShadow.CAST]]:
             for part: Dictionary in group[0]:
                 if part["mesh"]:
                     parts.append([part["mesh"], _part_buffer(transforms, part["transform"], center), transforms.size(),
@@ -746,11 +940,12 @@ func _grow_chunk(scatter: Scatter, coords: Vector2i, generation: int, job: Dicti
 ## On the main thread: the chunk grown (_grow_chunk()) drawn - a MultiMesh and its instance a part
 func _make_chunk(scatter: Scatter, coords: Vector2i, grown: Dictionary) -> void:
     var center: Vector3 = grown["center"]
-    var chunk: Dictionary = {"multimeshes": [], "instances": [], "lods": [], "shadows": [], "count": grown["count"],
-            "visible": -1, "center": center, "missing": grown["missing"]}
+    var chunk: Dictionary = {"multimeshes": [], "instances": [], "lods": [], "shadows": [], "ranges": [],
+            "count": grown["count"], "visible": -1, "center": center, "missing": grown["missing"]}
     var chunk_transform: Transform3D = scatter.transform * Transform3D(Basis.IDENTITY, center)
     for part: Array in grown["parts"]:
         _add_multimesh(scatter, chunk, chunk_transform, part[0], part[1], part[2], part[3], part[4], part[5])
+    _apply_visibility(scatter, chunk)
     scatter.chunks[coords] = chunk
 
 
@@ -867,8 +1062,8 @@ func _build_chunk(scatter: Scatter, coords: Vector2i, points: Array) -> void:
         buckets[entry["index"]][1].append(Transform3D(
                 Basis.IDENTITY.rotated(Vector3.UP, point["yaw"]).scaled(point["scale"]), surface))
         buckets[entry["index"]][2].append(point["priority"])
-    var chunk: Dictionary = {"multimeshes": [], "instances": [], "lods": [], "shadows": [], "count": 0, "visible": -1,
-            "center": center, "missing": missing}
+    var chunk: Dictionary = {"multimeshes": [], "instances": [], "lods": [], "shadows": [], "ranges": [], "count": 0,
+            "visible": -1, "center": center, "missing": missing}
     var chunk_transform: Transform3D = scatter.transform * Transform3D(Basis.IDENTITY, center)
     for bucket: Array in buckets.values():
         var entry: Dictionary = bucket[0]
@@ -889,6 +1084,7 @@ func _build_chunk(scatter: Scatter, coords: Vector2i, points: Array) -> void:
         _add_multimeshes(scatter, chunk, chunk_transform, entry["billboard_parts"], transforms, center,
                 lod if lod > 0.0 else 0.0, 0.0, PartShadow.CAST)
         chunk["count"] += transforms.size()
+    _apply_visibility(scatter, chunk)
     scatter.chunks[coords] = chunk
 
 
@@ -954,13 +1150,15 @@ func _add_multimesh(scatter: Scatter, chunk: Dictionary, chunk_transform: Transf
     var instance: RID = RenderingServer.instance_create2(multimesh, scatter.scenario)
     RenderingServer.instance_set_transform(instance, chunk_transform)
     _apply_part_shadow(scatter, instance, shadow)
-    if range_begin > 0.0 or range_end > 0.0:
+    # with the far trees the ranges are the chunk's (_apply_visibility()), as the GPU's are
+    if not scatter.far and (range_begin > 0.0 or range_end > 0.0):
         RenderingServer.instance_geometry_set_visibility_range(instance, range_begin, range_end, 0.0, 0.0,
                 RenderingServer.VISIBILITY_RANGE_FADE_DISABLED)
     chunk["multimeshes"].append(multimesh)
     chunk["instances"].append(instance)
     chunk["lods"].append(count)
     chunk["shadows"].append(shadow)
+    chunk["ranges"].append(Vector2(range_begin, range_end))
 
 
 ## The biome's shadows as the quality lets it cast them
@@ -969,24 +1167,41 @@ func _shadows(scatter: Scatter) -> RenderingServer.ShadowCastingSetting:
             else RenderingServer.SHADOW_CASTING_SETTING_OFF
 
 
-## An instance's shadow by its part's [param shadow]: the biome's, none, or the shadow alone - hidden
-## when the biome casts none (a shadows-only instance cast none is drawn as it is)
+## An instance's shadow by its part's [param shadow]: the biome's, none, or the shadow alone
 func _apply_part_shadow(scatter: Scatter, instance: RID, shadow: PartShadow) -> void:
-    var casting: RenderingServer.ShadowCastingSetting = _shadows(scatter)
     match shadow:
         PartShadow.CAST:
-            RenderingServer.instance_geometry_set_cast_shadows_setting(instance, casting)
+            RenderingServer.instance_geometry_set_cast_shadows_setting(instance, _shadows(scatter))
         PartShadow.NONE:
             RenderingServer.instance_geometry_set_cast_shadows_setting(instance, RenderingServer.SHADOW_CASTING_SETTING_OFF)
         PartShadow.ONLY:
             RenderingServer.instance_geometry_set_cast_shadows_setting(instance, RenderingServer.SHADOW_CASTING_SETTING_SHADOWS_ONLY)
-            RenderingServer.instance_set_visible(instance, not casting == RenderingServer.SHADOW_CASTING_SETTING_OFF)
+
+
+## What of a chunk is drawn: a shadows-only part not when the biome casts no shadows (drawn as it is
+## then); with the far trees a part within its range of the chunk's middle's horizontal distance from
+## the camera (scatter.view) - as billboard_particles.gdshader hides the GPU's billboards there
+func _apply_visibility(scatter: Scatter, chunk: Dictionary) -> void:
+    var casting: bool = not _shadows(scatter) == RenderingServer.SHADOW_CASTING_SETTING_OFF
+    var from_view: float = INF
+    if scatter.far and scatter.view.is_finite():
+        var middle: Vector3 = scatter.transform * (chunk["center"] as Vector3)
+        from_view = Vector2(middle.x, middle.z).distance_to(Vector2(scatter.view.x, scatter.view.z))
+    for index: int in chunk["instances"].size():
+        var visible: bool = casting or not chunk["shadows"][index] == PartShadow.ONLY
+        if scatter.far:
+            var part_range: Vector2 = chunk["ranges"][index]
+            visible = visible and from_view >= part_range.x and (part_range.y <= 0.0 or from_view < part_range.y)
+        RenderingServer.instance_set_visible(chunk["instances"][index], visible)
 
 
 func _apply_shadows(scatter: Scatter) -> void:
     for chunk: Dictionary in scatter.chunks.values():
         for index: int in chunk["instances"].size():
             _apply_part_shadow(scatter, chunk["instances"][index], chunk["shadows"][index])
+        _apply_visibility(scatter, chunk)
+    if scatter.far:
+        RenderingServer.instance_geometry_set_cast_shadows_setting(scatter.far["instance"], _shadows(scatter))
 
 
 ## The density LOD: a chunk draws a share of its instances by its distance from the camera
