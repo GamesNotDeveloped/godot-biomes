@@ -231,7 +231,7 @@ vec2 rotate_vec2(const vec2 v, const vec2 cs) {
 
 void accumulate_material(const vec3 base_ddx, const vec3 base_ddy, const float weight, const ivec3 index,
 			const uint control, const vec2 texture_weight, const ivec2 texture_id, const vec3 i_normal,
-			const float h, inout material mat) {
+			const float h, inout FarLook far, inout material mat) {
 
 	// Index position for detiling.
 	vec2 i_pos = fma(_region_locations[index.z], vec2(_region_size), vec2(index.xy)) * _vertex_spacing;
@@ -354,7 +354,7 @@ void accumulate_material(const vec3 base_ddx, const vec3 base_ddy, const float w
 		vec4 nrm = textureGrad(_texture_array_normal, vec3(id_uv, float(id)), id_dd.xy, id_dd.zw);
 
 		alb.rgb *= _texture_color_array[id].rgb;
-		alb.rgb = far_look(id, alb.rgb, base_ddx, base_ddy);
+		alb.rgb = far_look(id, alb.rgb, far);
 		nrm.a = clamp(nrm.a + _texture_roughness_mod_array[id], 0., 1.);
 		// Unpack and rotate normal map.
 		nrm.xyz = fma(nrm.xzy, vec3(2.0), vec3(-1.0));
@@ -402,7 +402,7 @@ void accumulate_material(const vec3 base_ddx, const vec3 base_ddy, const float w
 		vec4 alb = textureGrad(_texture_array_albedo, vec3(id_uv, float(id)), id_dd.xy, id_dd.zw);
 		vec4 nrm = textureGrad(_texture_array_normal, vec3(id_uv, float(id)), id_dd.xy, id_dd.zw);
 		alb.rgb *= _texture_color_array[id].rgb;
-		alb.rgb = far_look(id, alb.rgb, base_ddx, base_ddy);
+		alb.rgb = far_look(id, alb.rgb, far);
 		nrm.a = clamp(nrm.a + _texture_roughness_mod_array[id], 0., 1.);
 		// Unpack and rotate normal map.
 		nrm.xyz = fma(nrm.xzy, vec3(2.0), vec3(-1.0));
@@ -585,19 +585,21 @@ void fragment() {
 
 	// Struct to accumulate all texture data.
 	material mat = material(vec4(0.0), vec4(0.0), 0., 0., 0.);
+	// what the far look of the corners' textures takes once (terrain3d_far.gdshaderinc)
+	FarLook far = far_look_begin(base_ddx, base_ddy);
 
 	// 2 - 4 lookups, 2 - 6 if dual scale texture
 	accumulate_material(base_ddx, base_ddy, weights[3], index[3], control[3], t_weights[3],
-		texture_ids[3], index_normal[3], h[3], mat);
+		texture_ids[3], index_normal[3], h[3], far, mat);
 
 	// 6 - 12 lookups, 6 - 18 if dual scale texture
 	if (bilerp) {
 		accumulate_material(base_ddx, base_ddy, weights[2], index[2], control[2], t_weights[2],
-			texture_ids[2], index_normal[2], h[2], mat);
+			texture_ids[2], index_normal[2], h[2], far, mat);
 		accumulate_material(base_ddx, base_ddy, weights[1], index[1], control[1], t_weights[1],
-			texture_ids[1], index_normal[1], h[1], mat);
+			texture_ids[1], index_normal[1], h[1], far, mat);
 		accumulate_material(base_ddx, base_ddy, weights[0], index[0], control[0], t_weights[0],
-			texture_ids[0], index_normal[0], h[0], mat);
+			texture_ids[0], index_normal[0], h[0], far, mat);
 	}
 
 	// normalize accumulated values back to 0.0 - 1.0 range.
