@@ -225,7 +225,9 @@ vec2 rotate_vec2(const vec2 v, const vec2 cs) {
 }
 
 // 2-4 lookups ( 2-6 with dual scaling )
-#include "terrain3d_far.gdshaderinc"
+// by its whole path: Terrain3D compiles a copy of this code in a shader of its own, which has no
+// path for a relative include to be found from - its preprocessing failed, the raw code compiled
+#include "res://addons/gnd_biomes/terrain3d_far.gdshaderinc"
 
 void accumulate_material(const vec3 base_ddx, const vec3 base_ddy, const float weight, const ivec3 index,
 			const uint control, const vec2 texture_weight, const ivec2 texture_id, const vec3 i_normal,
